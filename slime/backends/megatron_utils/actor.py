@@ -8,6 +8,10 @@ from pathlib import Path
 import ray
 import torch
 import torch.distributed as dist
+
+from slime.utils.common import is_npu
+if is_npu():
+    import megatron_adaptor
 from megatron.core import mpu
 from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
@@ -28,6 +32,7 @@ from slime.utils.reloadable_process_group import (
 from slime.utils.routing_replay import RoutingReplay
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
+from slime.utils.common import is_npu
 
 from ...utils.profile_utils import TrainProfiler
 from ...utils.tensor_backper import TensorBackuper

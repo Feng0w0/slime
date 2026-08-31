@@ -22,6 +22,7 @@ def test_get_values_does_not_apply_rollout_temperature(monkeypatch):
     core_mod.mpu = mpu_stub
     monkeypatch.setitem(sys.modules, "megatron", megatron_mod)
     monkeypatch.setitem(sys.modules, "megatron.core", core_mod)
+    monkeypatch.setitem(sys.modules, "megatron_adaptor", types.ModuleType("megatron_adaptor"))
 
     try:
         from slime.backends.megatron_utils.loss import get_values

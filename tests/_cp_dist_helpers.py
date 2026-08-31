@@ -63,6 +63,7 @@ _fake_megatron.core = _fake_core
 sys.modules.setdefault("megatron", _fake_megatron)
 sys.modules.setdefault("megatron.core", _fake_core)
 sys.modules.setdefault("megatron.core.mpu", _fake_mpu)
+sys.modules.setdefault("megatron_adaptor", types.ModuleType("megatron_adaptor"))
 
 
 def stub_megatron_in_worker(cp_size: int, cp_rank: int) -> None:

@@ -26,10 +26,55 @@ import torch
 from slime.backends.megatron_utils.cp_utils import (  # noqa: E402
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
+    get_thd_partitioned_indices,
+    pad_thd_sequences_for_cp,
 )
 
 
 NUM_GPUS = 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("cp_size", "tp_size"), [(2, 1), (2, 2), (4, 1), (4, 2)])
+def test_thd_cp_padding_preserves_pre_tp4_contract(cp_size, tp_size):
+    """Previously validated CP/TP combinations retain exact 2*CP padding."""
+    tensors = [torch.arange(3), torch.arange(5)]
+    packed, cu_seqlens, cu_seqlens_padded = pad_thd_sequences_for_cp(tensors, 0, cp_size, tp_size)
+
+    alignment = 2 * cp_size
+    expected_padded_lengths = torch.tensor(
+        [((tensor.numel() + alignment - 1) // alignment) * alignment for tensor in tensors],
+        dtype=torch.int32,
+    )
+    assert torch.equal(cu_seqlens, torch.tensor([0, 3, 8], dtype=torch.int32))
+    assert torch.equal(cu_seqlens_padded[1:] - cu_seqlens_padded[:-1], expected_padded_lengths)
+    assert packed.numel() == int(expected_padded_lengths.sum())
+
+
+@pytest.mark.unit
+def test_thd_cp_padding_adds_only_minimal_tp4_tail_block():
+    """CP2+TP4 adds an independent tail and leaves real sequence chunks intact."""
+    tensors = [torch.arange(3), torch.arange(5)]
+    packed, cu_seqlens, cu_seqlens_padded = pad_thd_sequences_for_cp(tensors, 0, cp_size=2, tp_size=4)
+
+    # Legacy per-sequence padding is [4, 8] (12 global / 6 local tokens).
+    # TP4 needs one additional 2*CP block, yielding 16 global / 8 local.
+    assert torch.equal(cu_seqlens, torch.tensor([0, 3, 8, 8], dtype=torch.int32))
+    assert torch.equal(cu_seqlens_padded, torch.tensor([0, 4, 12, 16], dtype=torch.int32))
+    assert packed.numel() == 16
+    assert packed.numel() // 2 % 4 == 0
+
+    rank_indices = [get_thd_partitioned_indices(cu_seqlens_padded, packed.numel(), 2, rank) for rank in range(2)]
+    assert all(indices.numel() == 8 for indices in rank_indices)
+    assert torch.equal(torch.sort(torch.cat(rank_indices)).values, torch.arange(16))
+
+    # Token-level tensors must use exactly the same physical layout and rank indices.
+    masks = [torch.ones_like(tensor) for tensor in tensors]
+    packed_masks, mask_cu, mask_cu_padded = pad_thd_sequences_for_cp(masks, 0, cp_size=2, tp_size=4)
+    assert torch.equal(mask_cu, cu_seqlens)
+    assert torch.equal(mask_cu_padded, cu_seqlens_padded)
+    for indices in rank_indices:
+        assert packed.index_select(0, indices).shape == packed_masks.index_select(0, indices).shape
 
 
 def _make_inputs(per_sample_lengths: list[int]):

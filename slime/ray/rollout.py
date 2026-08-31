@@ -28,6 +28,7 @@ from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.types import Sample
+from slime.utils.common import is_npu
 
 from ..utils.metric_utils import has_repetition
 from .rollout_validation import validate_server_group_gpu_indices
@@ -37,6 +38,18 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+def _to_visible_device_index(device_id: int) -> int:
+    """Translate a Ray physical accelerator ID to the child process visible index."""
+    env_name = "ASCEND_RT_VISIBLE_DEVICES" if is_npu() else "CUDA_VISIBLE_DEVICES"
+    visible = os.environ.get(env_name)
+    if not visible:
+        return device_id
+    device_ids = [item.strip() for item in visible.split(",") if item.strip()]
+    try:
+        return device_ids.index(str(device_id))
+    except ValueError:
+        return device_id
 
 _ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": torch.long,
@@ -182,6 +195,7 @@ class ServerGroup:
         RolloutRayActor = ray.remote(SGLangEngine)
 
         rollout_engines = []
+        device_name = "NPU" if is_npu() else "GPU"
         for i in range(len(self.all_engines)):
             if self.all_engines[i] is not None:
                 continue
@@ -192,7 +206,7 @@ class ServerGroup:
 
             # Get the base GPU ID from placement group using gpu_offset.
             gpu_index = self.gpu_offset + i * num_gpus_per_engine_on_node
-            base_gpu_id = int(reordered_gpu_ids[gpu_index])
+            base_gpu_id = _to_visible_device_index(int(reordered_gpu_ids[gpu_index]))
 
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=pg,
@@ -215,7 +229,7 @@ class ServerGroup:
             }
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
-                num_gpus=num_gpus,
+                resources={device_name: num_gpus},
                 scheduling_strategy=scheduling_strategy,
                 runtime_env={
                     "env_vars": add_default_ray_env_vars(env_vars),
@@ -464,6 +478,7 @@ class RolloutManager:
         self.rollout_engine_lock = Lock.options(
             num_cpus=1,
             num_gpus=0,
+            resources={"NPU" if is_npu() else "GPU": 0},
             runtime_env={"env_vars": add_default_ray_env_vars()},
         ).remote()
         self.rollout_id = -1
@@ -1112,6 +1127,9 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
     pending_init_handles: list[Any] = []
     gpu_offset = 0
     engine_offset = 0
+    # Shared across ALL models/groups.
+
+    node_port_cursor: dict[int, int] = {}
 
     # Compute megatron GPU range for per-group offload decisions.
     rollout_pg_offset = _compute_rollout_offset(args)
@@ -1129,12 +1147,11 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
             args.sglang_router_port = router_port
 
         server_groups: list[ServerGroup] = []
-        port_cursors: dict[int, int] = {}
 
         has_epd = model_cfg.has_encoder_disaggregation
 
         def _make_group(group_cfg, router_ip, router_port, overrides_extra=None):
-            nonlocal engine_offset, gpu_offset
+            nonlocal engine_offset, gpu_offset, node_port_cursor
             gpus_per_engine = group_cfg.num_gpus_per_engine
             num_gpus_per_engine_on_node = min(gpus_per_engine, args.num_gpus_per_node)
             num_engines = group_cfg.num_gpus // num_gpus_per_engine_on_node
@@ -1180,7 +1197,7 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
                 if group_cfg.worker_type != "encoder":
                     continue
                 group = _make_group(group_cfg, router_ip, router_port)
-                handles, port_cursors = group.start_engines(port_cursors)
+                handles, node_port_cursor = group.start_engines(node_port_cursor)
                 if handles:
                     ray.get(handles)
                 urls = ray.get([e.get_url.remote() for e in group.engines])
@@ -1201,7 +1218,7 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
                     overrides_extra["language_only"] = True
                     overrides_extra["encoder_urls"] = encoder_urls
                 group = _make_group(group_cfg, router_ip, router_port, overrides_extra=overrides_extra)
-                handles, port_cursors = group.start_engines(port_cursors)
+                handles, node_port_cursor = group.start_engines(node_port_cursor)
                 non_encoder_handles.extend(handles)
                 server_groups.append(group)
 
@@ -1211,7 +1228,7 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
             all_init_handles: list = []
             for group_cfg in model_cfg.server_groups:
                 group = _make_group(group_cfg, router_ip, router_port)
-                handles, port_cursors = group.start_engines(port_cursors)
+                handles, node_port_cursor = group.start_engines(node_port_cursor)
                 all_init_handles.extend(handles)
                 server_groups.append(group)
 

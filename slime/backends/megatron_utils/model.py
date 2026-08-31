@@ -1,5 +1,6 @@
 import dataclasses
 import gc
+import json
 import logging
 import math
 import os
@@ -289,7 +290,14 @@ def setup_model_and_optimizer(
             - The learning-rate/weight-decay scheduler tied to the optimizer.
     """
     assert not args.moe_use_upcycling
-    assert args.load is not None or args.pretrained_checkpoint is not None
+    if not getattr(args, "allow_random_init", False):
+        assert args.load is not None or args.pretrained_checkpoint is not None
+    elif args.load is None and args.pretrained_checkpoint is None:
+        logger.warning(
+            "Building %s from random initialization because --allow-random-init is set; "
+            "this mode is only suitable for architecture smoke tests.",
+            role,
+        )
 
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
@@ -671,13 +679,17 @@ def train_one_step(
         check_mtp_only_grad(model, step_id)
 
     if valid_step:
-        # Update parameters.
-        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        if os.environ.get("SLIME_CONSISTENCY_FORWARD_ONLY", "0") == "1":
+            # Compare pre-update weights without allocating optimizer states.
+            logger.info("Consistency forward-only mode: skipping optimizer.step")
+        else:
+            # Update parameters.
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
-        # Update learning rate. Use the per-step global_batch_size when dynamic
-        # batching is on so the scheduler's samples-seen counter tracks reality.
-        assert update_successful
-        opt_param_scheduler.step(increment=step_global_batch_size)
+            # Update learning rate. Use the per-step global_batch_size when dynamic
+            # batching is on so the scheduler's samples-seen counter tracks reality.
+            assert update_successful
+            opt_param_scheduler.step(increment=step_global_batch_size)
 
     # release grad
     for model_chunk in model:
@@ -889,6 +901,14 @@ def train(
             log_dict["train/step"] = accumulated_step_id
             logging_utils.log(args, log_dict, step_key="train/step")
 
+            metrics_path = os.environ.get("SLIME_CONSISTENCY_METRICS_FILE")
+            if metrics_path:
+                metrics_file = Path(metrics_path)
+                metrics_file.parent.mkdir(parents=True, exist_ok=True)
+                metrics_record = {"step": accumulated_step_id, **log_dict}
+                with metrics_file.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(metrics_record, sort_keys=True) + "\n")
+
             if args.ci_test and "train/train_rollout_logprob_abs_diff" in log_dict:
                 assert log_dict["train/train_rollout_logprob_abs_diff"] <= 0.1, f"{log_dict=}"
 
@@ -991,13 +1011,18 @@ def initialize_model_and_optimizer(
     model[0].role = role
     reinit_critic_output_layer = _critic_output_layer_needs_reinit(args, model, role)
     clear_memory()
-    iteration, _ = load_checkpoint(
-        model,
-        optimizer,
-        opt_param_scheduler,
-        checkpointing_context={},
-        skip_load_to_model_and_opt=False,
-    )
+    if getattr(args, "allow_random_init", False) and args.load is None:
+        # Architecture-only smoke tests deliberately have no checkpoint.  Keep
+        # Megatron's freshly initialized parameters and start at iteration 0.
+        iteration = 0
+    else:
+        iteration, _ = load_checkpoint(
+            model,
+            optimizer,
+            opt_param_scheduler,
+            checkpointing_context={},
+            skip_load_to_model_and_opt=False,
+        )
     if reinit_critic_output_layer:
         _reinitialize_critic_output_layer(args, model)
         if (args.fp16 or args.bf16) and optimizer is not None:

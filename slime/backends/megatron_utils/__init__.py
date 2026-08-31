@@ -1,10 +1,27 @@
+import ctypes
 import logging
+from pathlib import Path
 
 import torch
+
+from slime.utils.common import is_npu
+if is_npu():
+    import megatron_adaptor
 
 try:
     import deep_ep
     from torch_memory_saver import torch_memory_saver
+
+    if is_npu():
+        deep_ep_opapi = (
+            Path(deep_ep.__file__).resolve().parent
+            / "vendors/hwcomputing/op_api/lib/libcust_opapi.so"
+        )
+        if not deep_ep_opapi.exists():
+            raise ImportError(f"Cannot find DeepEP custom operator library: {deep_ep_opapi}")
+        # DeepEP looks up custom aclnn entry points through RTLD_DEFAULT. Its
+        # extension only links libopapi, so load the packaged custom API globally.
+        _deep_ep_opapi_handle = ctypes.CDLL(str(deep_ep_opapi), mode=ctypes.RTLD_GLOBAL)
 
     old_init = deep_ep.Buffer.__init__
 
@@ -26,6 +43,7 @@ try:
             cdll.tms_set_interesting_region(original_interesting_region)
 
     deep_ep.Buffer.__init__ = new_init
+
 except ImportError:
     logging.warning("deep_ep is not installed, some functionalities may be limited.")
 

@@ -8,6 +8,7 @@ from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, add_default_ray_env_vars
+from slime.utils.common import is_npu
 
 
 class RayTrainGroup:
@@ -69,7 +70,6 @@ class RayTrainGroup:
             **{name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST},
             **self.args.train_env_vars,
         }
-
         if self.args.offload_train and self.args.train_backend == "megatron":
             import torch_memory_saver
 
@@ -103,8 +103,8 @@ class RayTrainGroup:
         else:
             actor_impl = self._actor_cls
 
+        device_name = "NPU" if is_npu() else "GPU"
         actor_options = {
-            "num_gpus": 1,
             "runtime_env": {"env_vars": add_default_ray_env_vars(env_vars)},
         }
         if getattr(self.args, "rollout_data_transport", "object-store") == "nixl":
@@ -117,7 +117,7 @@ class RayTrainGroup:
         for rank in range(world_size):
             actor = TrainRayActor.options(
                 num_cpus=num_gpus_per_actor,
-                num_gpus=num_gpus_per_actor,
+                resources={device_name: num_gpus_per_actor},
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=reordered_bundle_indices[rank],

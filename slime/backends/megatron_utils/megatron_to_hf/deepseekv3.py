@@ -1,3 +1,4 @@
+import os
 import re
 
 import torch
@@ -28,7 +29,15 @@ def convert_deepseekv3_to_hf(args, name, param):
         if match:
             rest, expert_idx = match.groups()
             if rest == "linear_fc1":
-                gate_weight, up_weight = param.chunk(2, dim=0)
+                gate_weight, up_weight = (chunk.clone() for chunk in param.chunk(2, dim=0))
+                if (
+                    os.environ.get("SLIME_CONSISTENCY_WEIGHT_TRACE") == "1"
+                    and layer_idx == "3"
+                    and expert_idx == "0"
+                ):
+                    sample = gate_weight.flatten()[:64].float().cpu().tolist()
+                    print(f"SLIME_WEIGHT_TRACE source gate expert0 {sample}", flush=True)
+
                 outputs = [
                     (f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight", gate_weight),
                     (f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight", up_weight),
@@ -48,7 +57,7 @@ def convert_deepseekv3_to_hf(args, name, param):
         if match:
             rest = match.groups()[0]
             if rest == "linear_fc1.weight":
-                gate_weight, up_weight = param.chunk(2, dim=0)
+                gate_weight, up_weight = (chunk.clone() for chunk in param.chunk(2, dim=0))
                 return [
                     (f"model.layers.{layer_idx}.mlp.shared_experts.gate_proj.weight", gate_weight),
                     (f"model.layers.{layer_idx}.mlp.shared_experts.up_proj.weight", up_weight),
@@ -106,7 +115,7 @@ def convert_deepseekv3_to_hf(args, name, param):
                 (f"model.layers.{layer_idx}.self_attn.v_proj.bias", v_bias),
             ]
         elif rest == "mlp.linear_fc1.weight":
-            gate_weight, up_weight = param.chunk(2, dim=0)
+            gate_weight, up_weight = (chunk.clone() for chunk in param.chunk(2, dim=0))
             return [
                 (f"model.layers.{layer_idx}.mlp.gate_proj.weight", gate_weight),
                 (f"model.layers.{layer_idx}.mlp.up_proj.weight", up_weight),

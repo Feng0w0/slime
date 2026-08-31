@@ -4,6 +4,7 @@ import logging
 import psutil
 import torch
 import torch.distributed as dist
+from slime.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -11,14 +12,27 @@ logger = logging.getLogger(__name__)
 def clear_memory(clear_host_memory: bool = False):
     torch.cuda.synchronize()
     gc.collect()
-    torch.cuda.empty_cache()
+    try:
+        torch.cuda.empty_cache()
+    except RuntimeError as e:
+        if "captures_underway.empty()" in str(e):
+            print("[WARN] skip empty_cache because NPU graph is active")
+        else:
+            raise
     if clear_host_memory:
-        torch._C._host_emptyCache()
+        if is_npu():
+            torch.npu.empty_cache()
+        else:
+            torch._C._host_emptyCache()
 
 
 def available_memory():
-    device = torch.cuda.current_device()
-    free, total = torch.cuda.mem_get_info(device)
+    if is_npu():
+        device = torch.npu.current_device()
+        free, total = torch.npu.mem_get_info(device)
+    else:
+        device = torch.cuda.current_device()
+        free, total = torch.cuda.mem_get_info(device)
     vm = psutil.virtual_memory()
     return {
         "gpu": str(device),

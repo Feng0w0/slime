@@ -10,6 +10,9 @@ NUM_GPUS = 0
 
 
 def _load_megatron_utils_init(monkeypatch, buffer_cls, tms_impl, module_name):
+    import slime.utils.common
+
+    monkeypatch.setattr(slime.utils.common, "is_npu", lambda: False)
     deep_ep = types.ModuleType("deep_ep")
     deep_ep.Buffer = buffer_cls
     monkeypatch.setitem(sys.modules, "deep_ep", deep_ep)
@@ -18,6 +21,7 @@ def _load_megatron_utils_init(monkeypatch, buffer_cls, tms_impl, module_name):
     torch_memory_saver_module.torch_memory_saver = types.SimpleNamespace(_impl=tms_impl)
     monkeypatch.setitem(sys.modules, "torch_memory_saver", torch_memory_saver_module)
     monkeypatch.setitem(sys.modules, "megatron", types.ModuleType("megatron"))
+    monkeypatch.setitem(sys.modules, "megatron_adaptor", types.ModuleType("megatron_adaptor"))
 
     package_path = Path(__file__).parents[1] / "slime" / "backends" / "megatron_utils"
     spec = importlib.util.spec_from_file_location(

@@ -1,5 +1,6 @@
 import ast
 import logging
+import os
 
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
@@ -148,7 +149,7 @@ def _set_default_megatron_args(args):
     # always use zero optimizer
     args.use_distributed_optimizer = True
     # TODO: maybe change this after megatron has good fp8 support
-    args.bf16 = not args.fp16
+    args.bf16 = not args.fp16 and os.getenv("SLIME_MEGATRON_FP32", "0") != "1"
     # Checkpoint I/O defaults: these keep checkpoint contents unchanged while
     # reducing repeated validation/planning work and parallelizing load.
     args.use_persistent_ckpt_worker = True

@@ -1,5 +1,6 @@
 import copy
 import math
+import os
 from dataclasses import dataclass
 from typing import NoReturn
 
@@ -8,6 +9,7 @@ from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TELinear
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.common.embeddings import RotaryEmbedding, YarnRotaryEmbedding, _yarn_get_mscale
+from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.post_training.modelopt.layers import Linear
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
@@ -24,6 +26,7 @@ from megatron.core.transformer.moe.moe_utils import RouterGatingLinearFunction a
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from transformers import AutoConfig
 
 from .ops.indexer import generate_varlen_mask_params, lighting_indexer
@@ -32,6 +35,30 @@ from .ops.sparse_mla import SparseMLA
 # Names of the indexer submodules. On a DSA model with *cross-layer index
 # sharing* these only exist on "computing" layers; "skip" layers drop them.
 _INDEXER_SUBMODULE_NAMES = ("wq_b", "wk", "k_norm", "weights_proj")
+
+
+class GLM5TransformerLayer(TransformerLayer):
+    """GLM-5 layer with opt-in consistency diagnostics.
+
+    The zero-MLP path is deliberately environment-gated and is only used to
+    localize train/inference numerical drift. With the flag unset this class
+    is behaviorally identical to Megatron's ``TransformerLayer``.
+    """
+
+    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):
+        selected_layers = {
+            int(value.strip())
+            for value in os.getenv("SLIME_CONSISTENCY_ZERO_MLP_LAYERS", "").split(",")
+            if value.strip()
+        }
+        layer_index = int(getattr(self, "layer_number", 0)) - 1
+        if os.getenv("SLIME_CONSISTENCY_ZERO_MLP", "0") == "1" or layer_index in selected_layers:
+            return hidden_states
+        return super()._forward_mlp(
+            hidden_states,
+            inference_context=inference_context,
+            padding_mask=padding_mask,
+        )
 
 
 def is_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
@@ -296,7 +323,13 @@ class DSAMultiLatentAttention(Attention):
             ends = scatter_to_sequence_parallel_region(ends, group=parallel_state.get_context_parallel_group())
             _, topk_indices = fused_select_topk(index_query, index_key, head_weights, starts, ends)
 
-        core_attn_out, _ = SparseMLA.apply(q, kv, topk_indices, self.softmax_scale)
+        core_attn_out, _ = SparseMLA.apply(
+            q,
+            kv,
+            topk_indices,
+            self.softmax_scale,
+            packed_seq_params.cu_seqlens_q,
+        )
         core_attn_out = torch.einsum("thm,hdm->thd", core_attn_out, wv)
 
         core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
@@ -310,6 +343,8 @@ class DSAMultiLatentAttention(Attention):
         # Output. [sq, b, h]
         # =================
         output, bias = self.linear_proj(core_attn_out)
+        if os.getenv("SLIME_CONSISTENCY_ZERO_ATTN", "0") == "1":
+            output = torch.zeros_like(output)
         return output, bias
 
 
@@ -575,24 +610,29 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         )
 
         def fuse_rope(q, cu_seqlens, gathered=False):
-            # worse precision than apex.
-            # from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb_thd
-            from apex.transformer.functional import fused_apply_rotary_pos_emb_thd
-
-            # mla use rope interleave
-            x1 = q[..., 0::2]
-            x2 = q[..., 1::2]
-            t = torch.cat((x1, x2), dim=-1)
-            # TODO remove copy here
-            # fuse rope not support this way rope (diff with cp)
+            # Apex is not part of the Ascend stack. Megatron-Core's unfused
+            # implementation is device agnostic and handles MLA interleaving
+            # through config.multi_latent_attention.
             if gathered:
-                return fused_apply_rotary_pos_emb_thd(t, cu_seqlens, rotary_pos_emb.squeeze(0))
+                return apply_rotary_pos_emb(
+                    q,
+                    rotary_pos_emb,
+                    config=self.config,
+                    cu_seqlens=cu_seqlens,
+                    cp_group=parallel_state.get_context_parallel_group(),
+                )
             else:
                 seq_len = q.shape[0]
                 cp_size = parallel_state.get_context_parallel_world_size()
                 cp_rank = parallel_state.get_context_parallel_rank()
-                t = t.repeat(cp_size, 1, 1)
-                out = fused_apply_rotary_pos_emb_thd(t, cu_seqlens, rotary_pos_emb.squeeze(0))
+                q = q.repeat(cp_size, 1, 1)
+                out = apply_rotary_pos_emb(
+                    q,
+                    rotary_pos_emb,
+                    config=self.config,
+                    cu_seqlens=cu_seqlens,
+                    cp_group=parallel_state.get_context_parallel_group(),
+                )
                 return out[cp_rank * seq_len : (cp_rank + 1) * seq_len]
 
         q_pos_emb = fuse_rope(q_pos_emb, cu_seqlens_q, gathered=False)
@@ -625,7 +665,11 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
             index_q = gather_from_sequence_parallel_region(index_q)
 
         index_k, _ = self.wk(hidden_states)
-        index_k = self.k_norm(index_k.squeeze(1).float()).bfloat16()
+        # TransformerEngineNPU's LayerNorm requires the activation and affine
+        # weight to have the same dtype. The CUDA implementation accepts the
+        # former FP32 promotion, but the Ascend op rejects FP32 input with BF16
+        # weights, so normalize in the projection's native dtype.
+        index_k = self.k_norm(index_k.squeeze(1)).bfloat16()
 
         if self.config.sequence_parallel:
             index_k = gather_from_sequence_parallel_region(index_k)
@@ -772,6 +816,7 @@ def get_glm5_spec(args, config, vp_stage):
     )
     for layer_id in range(num_layers_to_build):
         layer_specs = copy.deepcopy(transformer_layer_spec.layer_specs[layer_id])
+        layer_specs.module = GLM5TransformerLayer
         layer_specs.submodules.self_attention = self_attn_module_spec
         transformer_layer_spec.layer_specs[layer_id] = layer_specs
     return transformer_layer_spec

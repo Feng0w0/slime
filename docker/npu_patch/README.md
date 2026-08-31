@@ -6,14 +6,14 @@ This guide provides instructions for installing Slime with NPU support, includin
 
 | Component       | Version/Commit                           | Source                                                                                                              |
 | --------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| Slime           | v0.2.2                                   | [GitHub](https://github.com/THUDM/slime/tree/v0.2.2)                                                                |
-| SGLang          | dce8b0606c06d3a191a24c7b8cbe8e238ab316c9 | [GitHub](https://github.com/sgl-project/sglang/tree/sglang-slime)                                             |
-| SGL Kernel NPU  | 2026.02.01                               | [GitHub](https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.02.01)                                     |
+| Slime           | v0.3.0                                   | [GitHub](https://github.com/THUDM/slime/tree/v0.3.0)                                                                |
+| SGLang          | v0.5.15.post1 plus manifest patches      | [GitHub](https://github.com/sgl-project/sglang/tree/v0.5.15.post1)                                                  |
+| SGL Kernel NPU  | 2026.6.1 plus upstream fix `9765e27`    | [GitHub](https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.6.1)                                      |
 | Megatron-Bridge | 35b4ebfc486fb15dcc0273ceea804c3606be948a | [GitHub](https://github.com/fzyzcjy/Megatron-Bridge)                                                                |
-| Megatron-LM     | 3714d81d418c9f1bca4594fc35f9e8289f652862 | [GitHub](https://github.com/NVIDIA/Megatron-LM)                                                                     |
+| Megatron-LM     | 1dcf0dafa884ad52ffb243625717a3471643e087 | [GitHub](https://github.com/NVIDIA/Megatron-LM)                                                                     |
 | MindSpeed       | fc63de5c48426dd019c3b3f39e65f5bdf56e4086 | [GitCode](https://gitcode.com/Ascend/MindSpeed)                                                                     |
 | HDK             | 25.3.RC1                                 | [Ascend](https://www.hiascend.com/hardware/firmware-drivers/commercial?product=7\&model=33)                         |
-| CANN            | 8.5.0                                    | [Ascend](https://www.hiascend.com/developer/download/community/result?module=cann\&cann=8.5.0\&product=7\&model=33) |
+| CANN            | 9.0.0                                    | [Ascend](https://www.hiascend.com/developer/download)                                                               |
 
 ## Preparing the Running Environment
 
@@ -44,7 +44,7 @@ source <CANN_PATH>/nnal/atb/set_env.sh
 ### PyTorch and PyTorch NPU
 
 ```shell
-pip install torch-npu==2.8.0
+pip install torch==2.10.0 torch-npu==2.10.0.post4
 ```
 
 ## Installing Dependencies
@@ -54,19 +54,22 @@ pip install torch-npu==2.8.0
 ```shell
 cd <WORKSPACE>
 git clone https://github.com/sgl-project/sglang.git && cd sglang
-git checkout dce8b0606c06d3a191a24c7b8cbe8e238ab316c9
+git checkout v0.5.15.post1
 mv python/pyproject.toml python/pyproject.toml.backup
 mv python/pyproject_other.toml python/pyproject.toml
 pip install -e "python[srt_npu]"
-pip install torch-npu==2.8.0
+pip install torch-npu==2.10.0.post4
 ```
 
 ### SGL Kernel NPU and Torch Memory Saver
 
-Download `sgl-kernel-npu-2026.02.01-torch2.8.0-py311-cann8.5.0-a3-aarch64.zip` from the release link, then install:
+Download the 2026.6.1 wheel bundle matching torch 2.10.0, Python 3.11,
+CANN 9.0.0 and the target NPU, then install it. Apply the authoritative
+`patches/third_party/sgl-kernel-npu/` patches when rebuilding; the no-bias
+Python fix must match upstream commit `9765e27`.
 
 ```shell
-pip install sgl_kernel_npu-2026.2.1-cp311-cp311-linux_aarch64.whl
+pip install sgl_kernel_npu-2026.6.1-cp311-cp311-linux_aarch64.whl
 pip install torch_memory_saver-0.0.8-cp311-cp311-linux_aarch64.whl
 ```
 
@@ -189,4 +192,3 @@ bash examples/geo3k_vlm_multi_turn/run_ppo_npu.sh 2>&1 | tee -a <LOG_FILE>
 | `<WORKSPACE>` | Root directory for all installations | `/root/slime-release` |
 | `<CANN_PATH>` | Path to CANN installation directory  | `/usr/local/ascend`   |
 | `<LOG_FILE>`  | Path to log file for training output | `training.log`        |
-

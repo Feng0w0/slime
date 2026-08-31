@@ -8,14 +8,16 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .actor_group import RayTrainGroup
 from .utils import add_default_ray_env_vars
+from slime.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
 
 
-@ray.remote(num_gpus=1)
+@ray.remote
 class InfoActor:
     def get_ip_and_gpu_id(self):
-        return ray.util.get_node_ip_address(), ray.get_gpu_ids()[0]
+        accelerator = "NPU" if is_npu() else "GPU"
+        return ray.util.get_node_ip_address(), ray.get_runtime_context().get_accelerator_ids()[accelerator][0]
 
 
 def sort_key(x):
@@ -36,7 +38,7 @@ def sort_key(x):
             # representation that allows for sorting.
             node_ip_parts = [ord(c) for c in node_identifier]
 
-    return (node_ip_parts, gpu_id)
+    return (node_ip_parts, int(gpu_id))
 
 
 def _create_placement_group(num_gpus):
@@ -44,7 +46,8 @@ def _create_placement_group(num_gpus):
     if num_gpus == 0:
         return None, [], []
 
-    bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
+    device_name = "NPU" if is_npu() else "GPU"
+    bundles = [{device_name: 1, "CPU": 1} for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
 
@@ -71,6 +74,7 @@ def _create_placement_group(num_gpus):
     for i in range(num_bundles):
         info_actors.append(
             InfoActor.options(
+                resources={device_name: 1},
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=i,

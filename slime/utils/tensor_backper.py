@@ -56,8 +56,11 @@ class _TensorBackuperNormal(TensorBackuper):
         backup_dict = self._backups[tag]
         for name, param in self._source_getter():
             if name not in backup_dict:
-                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
-            backup_dict[name].copy_(param.detach(), non_blocking=True)
+                # These snapshots live for the full actor/ref lifecycle. Keeping
+                # complete model copies in CANN pinned-host memory exhausts
+                # aclrtMallocHostWithCfg even when ordinary RAM is available.
+                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=False)
+            backup_dict[name].copy_(param.detach(), non_blocking=False)
         torch.cuda.synchronize()
 
     @torch.no_grad()
@@ -70,7 +73,7 @@ class _TensorBackuperNormal(TensorBackuper):
         backup_dict = self._backups[tag]
         for name, param in self._source_getter():
             assert name in backup_dict
-            param.copy_(backup_dict[name], non_blocking=True)
+            param.copy_(backup_dict[name], non_blocking=False)
         torch.cuda.synchronize()
 
 

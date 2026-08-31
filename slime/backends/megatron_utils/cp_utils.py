@@ -1,9 +1,77 @@
+import math
 from collections.abc import Callable, Sequence
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from megatron.core import mpu
+
+
+def pad_thd_sequences_for_cp(
+    tensors: list[torch.Tensor],
+    pad_value: int,
+    cp_size: int,
+    tp_size: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad packed THD sequences while preserving the global CP metadata contract.
+
+    Every sequence keeps the established ``2 * cp_size`` alignment.  If the
+    resulting CP-local packed length is not divisible by tensor parallelism,
+    a separate physical-only sequence supplies the smallest additional
+    ``2 * cp_size`` block count needed for TP alignment.
+    """
+    assert tensors, "THD packing requires at least one sequence"
+    assert cp_size > 0
+    assert tp_size > 0
+
+    sequence_alignment = 2 * cp_size
+    cu_seqlens = [0]
+    cu_seqlens_padded = [0]
+    padded_tensors = []
+
+    for tensor in tensors:
+        seq_len = tensor.size(0)
+        padded_len = ((seq_len + sequence_alignment - 1) // sequence_alignment) * sequence_alignment
+        pad_len = padded_len - seq_len
+
+        cu_seqlens.append(cu_seqlens[-1] + seq_len)
+        cu_seqlens_padded.append(cu_seqlens_padded[-1] + padded_len)
+        padded_tensors.append(F.pad(tensor, (0, pad_len), value=pad_value) if pad_len else tensor)
+
+    # Each CP rank receives 1/cp_size of the physical packed stream.  Keep
+    # per-sequence CP alignment intact and minimally align that local total
+    # for TP, instead of over-padding every real sequence to CP*TP.
+    #
+    # The TP-only tail must be a separate padding sequence.  Extending the
+    # final real sequence changes its mirrored CP chunk size, while response
+    # extraction intentionally derives that chunk size from the real token
+    # length.  That makes the second chunk's logits and labels drift apart.
+    local_alignment = math.lcm(2, tp_size)
+    global_alignment = cp_size * local_alignment
+    tail_pad = (-cu_seqlens_padded[-1]) % global_alignment
+    if tail_pad:
+        padded_tensors.append(
+            torch.full(
+                (tail_pad,),
+                pad_value,
+                dtype=tensors[0].dtype,
+                device=tensors[0].device,
+            )
+        )
+        # This is a physical-only sequence: it owns no real tokens.
+        cu_seqlens.append(cu_seqlens[-1])
+        cu_seqlens_padded.append(cu_seqlens_padded[-1] + tail_pad)
+
+    packed = torch.cat(padded_tensors, dim=0)
+    assert packed.size(0) // cp_size % tp_size == 0, (
+        f"CP-local THD token count {packed.size(0) // cp_size} must be divisible by TP size {tp_size}"
+    )
+    device = packed.device
+    return (
+        packed,
+        torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
+        torch.tensor(cu_seqlens_padded, dtype=torch.int32, device=device),
+    )
 
 
 def get_logits_and_tokens_offset_with_cp(
@@ -42,6 +110,62 @@ def get_logits_and_tokens_offset_with_cp(
         token_1 = (0, 0)
 
     return chunk_size, (chunk_0, chunk_1), (logits_0, logits_1), (token_0, token_1)
+
+
+def get_thd_partitioned_indices(
+    cu_seqlens_padded: torch.Tensor,
+    total_tokens: int,
+    cp_size: int,
+    cp_rank: int,
+) -> torch.Tensor:
+    """Build THD CP partition indices matching Megatron/TE's mirrored block layout."""
+    assert cp_size > 1
+    assert 0 <= cp_rank < cp_size
+
+    indices = []
+
+    for i in range(cu_seqlens_padded.numel() - 1):
+        seq_start = int(cu_seqlens_padded[i].item())
+        seq_end = int(cu_seqlens_padded[i + 1].item())
+        seq_len = seq_end - seq_start
+
+        assert seq_len % (2 * cp_size) == 0, (
+            f"THD CP padded sequence length {seq_len} "
+            f"must be divisible by {2 * cp_size}"
+        )
+
+        chunk_len = seq_len // (2 * cp_size)
+        front_chunk = cp_rank
+        back_chunk = 2 * cp_size - cp_rank - 1
+        front_start = seq_start + front_chunk * chunk_len
+        back_start = seq_start + back_chunk * chunk_len
+
+        indices.append(
+            torch.arange(
+                front_start,
+                front_start + chunk_len,
+                dtype=torch.long,
+                device=cu_seqlens_padded.device,
+            )
+        )
+        indices.append(
+            torch.arange(
+                back_start,
+                back_start + chunk_len,
+                dtype=torch.long,
+                device=cu_seqlens_padded.device,
+            )
+        )
+
+    indices = torch.cat(indices)
+
+    assert int(cu_seqlens_padded[-1].item()) == total_tokens
+    assert indices.numel() == total_tokens // cp_size, (
+        f"local token count mismatch: "
+        f"{indices.numel()} != {total_tokens // cp_size}"
+    )
+
+    return indices
 
 
 def get_sum_of_sample_mean(

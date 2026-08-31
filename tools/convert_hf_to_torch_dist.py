@@ -15,6 +15,7 @@ from slime.backends.megatron_utils.initialize import init
 from slime.backends.megatron_utils.model_provider import get_model_provider_func
 from slime.utils.logging_utils import configure_logger
 from slime.utils.memory_utils import print_memory
+from slime.utils.common import is_npu
 
 
 def add_convertion_args(parser):
@@ -92,18 +93,27 @@ def main():
     local_rank = int(os.getenv("LOCAL_RANK") or os.getenv("SLURM_LOCALID") or 0)
     global_rank = int(os.getenv("RANK") or os.getenv("SLURM_PROCID") or 0)
 
-    torch.cuda.set_device(local_rank)
+    device_type = "npu" if is_npu() else "cuda"
+    backend = "hccl" if is_npu() else "nccl"
+    if is_npu():
+        torch.npu.set_device(local_rank)
+    else:
+        torch.cuda.set_device(local_rank)
     os.environ.setdefault("WORLD_SIZE", str(world_size))
     os.environ.setdefault("RANK", str(global_rank))
     os.environ.setdefault("LOCAL_RANK", str(local_rank))
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "12355")
-    dist.init_process_group(
-        backend="nccl",
-        world_size=world_size,
-        rank=global_rank,
-        device_id=torch.device(f"cuda:{local_rank}"),
-    )
+    process_group_kwargs = {
+        "backend": backend,
+        "world_size": world_size,
+        "rank": global_rank,
+    }
+    # torch.distributed's device-bound communicator shortcut is implemented
+    # for NCCL here, but this torch-npu/HCCL build rejects an NPU device_id.
+    if not is_npu():
+        process_group_kwargs["device_id"] = torch.device(f"{device_type}:{local_rank}")
+    dist.init_process_group(**process_group_kwargs)
     args = get_args()
     init(args)
 

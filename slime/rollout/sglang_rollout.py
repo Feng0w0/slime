@@ -3,6 +3,7 @@ import copy
 import inspect
 import json
 import logging
+import os
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -209,6 +210,74 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     else:
         new_response_tokens, new_response_log_probs = [], []
 
+    # Autoregressive decode and full-sequence training use different forward
+    # shapes and, on NPU, can select different fused kernels.  For a controlled
+    # train/infer consistency experiment, optionally score the exact generated
+    # prompt+response again through SGLang's teacher-forced prefill path.  The
+    # trace mode measures decode-vs-prefill drift without changing training
+    # data; replace mode stores the prefill scores as rollout logprobs.
+    prefill_rescore_mode = os.environ.get("SLIME_CONSISTENCY_PREFILL_RESCORE", "off").lower()
+    if prefill_rescore_mode not in {"off", "trace", "replace"}:
+        raise ValueError(
+            "SLIME_CONSISTENCY_PREFILL_RESCORE must be one of: off, trace, replace; "
+            f"got {prefill_rescore_mode!r}"
+        )
+    if prefill_rescore_mode != "off" and new_response_tokens:
+        if images:
+            raise NotImplementedError("Consistency prefill rescore currently supports text-only samples")
+
+        score_payload = {
+            "input_ids": prompt_ids + new_response_tokens,
+            # SGLang reports logprobs after temperature scaling.  Keep the
+            # teacher-forced rescore on the exact same distribution as decode;
+            # Megatron's consistency path applies the same logits/temperature.
+            "sampling_params": {
+                "max_new_tokens": 0,
+                "temperature": sampling_params.get("temperature", 1.0),
+            },
+            "return_logprob": True,
+            "return_text_in_logprobs": False,
+            # Request the complete teacher-forced sequence and take the response
+            # tail below.  SGLang deliberately returns ``None`` for the first
+            # token in a sequence because that token has no predecessor.  The
+            # tail-slice is also the method used by SGLang's own KL tests.
+            "logprob_start_len": 0,
+        }
+        with trace_span(sample, "sglang_prefill_rescore"):
+            score_output = await post(url, score_payload, headers=headers)
+
+        input_token_logprobs = score_output["meta_info"].get("input_token_logprobs") or []
+        input_token_logprobs = input_token_logprobs[-len(new_response_tokens) :]
+        prefill_tokens = [item[1] for item in input_token_logprobs]
+        prefill_log_probs = [item[0] for item in input_token_logprobs]
+        if prefill_tokens != new_response_tokens:
+            raise RuntimeError(
+                "SGLang prefill rescore token mismatch: "
+                f"expected {len(new_response_tokens)} response tokens, got {len(prefill_tokens)}"
+            )
+
+        none_decode = [i for i, value in enumerate(new_response_log_probs) if value is None]
+        none_prefill = [i for i, value in enumerate(prefill_log_probs) if value is None]
+        if none_decode or none_prefill:
+            raise RuntimeError(
+                "SGLang consistency rescore returned missing response logprobs: "
+                f"decode_none={none_decode[:8]}, prefill_none={none_prefill[:8]}"
+            )
+
+        signed_diffs = [float(a) - float(b) for a, b in zip(new_response_log_probs, prefill_log_probs)]
+        abs_diffs = [abs(value) for value in signed_diffs]
+        trace_payload = {
+            "tokens": len(abs_diffs),
+            "decode_prefill_mae": sum(abs_diffs) / max(len(abs_diffs), 1),
+            "decode_prefill_max_abs": max(abs_diffs, default=0.0),
+            "decode_prefill_mean_signed": sum(signed_diffs) / max(len(signed_diffs), 1),
+            "mode": prefill_rescore_mode,
+        }
+        print("GLM52_SGLANG_PREFILL_RESCORE=" + json.dumps(trace_payload, separators=(",", ":")), flush=True)
+
+        if prefill_rescore_mode == "replace":
+            new_response_log_probs = prefill_log_probs
+
     sample.append_response_tokens(
         args,
         tokens=new_response_tokens,
@@ -325,6 +394,69 @@ async def generate_and_rm_group(
         )
 
     group = await asyncio.gather(*tasks)
+
+    # Batch-invariance fixture for train/infer consistency debugging.  Natural
+    # sampling cannot guarantee identical continuations (and temperature=0 has
+    # backend-specific edge cases), so use the first completed trajectory as a
+    # fixed token sequence and teacher-force that exact sequence concurrently
+    # through SGLang for every slot in the group.  Megatron subsequently sees
+    # the same duplicated token sequences, allowing both within-backend batch
+    # invariance and cross-backend mismatch to be measured on one fixture.
+    if os.environ.get("GLM52_BATCH_INVARIANCE") == "1" and len(group) >= 2:
+        template = group[0]
+        fixed_group = []
+        for original in group:
+            clone = copy.deepcopy(template)
+            clone.group_index = original.group_index
+            clone.index = original.index
+            clone.rollout_id = original.rollout_id
+            clone.session_id = original.session_id
+            fixed_group.append(clone)
+
+        async def _score_fixed_sequence(sample: Sample) -> Sample:
+            response_length = int(sample.response_length)
+            if response_length <= 0:
+                return sample
+            response_tokens = sample.tokens[-response_length:]
+            payload = {
+                "input_ids": sample.tokens,
+                "sampling_params": {"max_new_tokens": 0, "temperature": 1.0},
+                "return_logprob": True,
+                "return_text_in_logprobs": False,
+                "logprob_start_len": 0,
+            }
+            headers = None
+            if sample.session_id and getattr(args, "router_policy", None) == "consistent_hashing":
+                headers = {"X-SMG-Routing-Key": sample.session_id}
+            url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+            output = await post(url, payload, headers=headers)
+            scored = (output["meta_info"].get("input_token_logprobs") or [])[-response_length:]
+            scored_tokens = [item[1] for item in scored]
+            scored_log_probs = [item[0] for item in scored]
+            if scored_tokens != response_tokens or any(value is None for value in scored_log_probs):
+                raise RuntimeError("GLM52 batch-invariance SGLang fixed-sequence rescore mismatch")
+            sample.rollout_log_probs = [float(value) for value in scored_log_probs]
+            return sample
+
+        group = await asyncio.gather(*[_score_fixed_sequence(sample) for sample in fixed_group])
+        reference = np.asarray(group[0].rollout_log_probs, dtype=np.float32)
+        slot_maes = [
+            float(np.mean(np.abs(reference - np.asarray(sample.rollout_log_probs, dtype=np.float32))))
+            for sample in group[1:]
+        ]
+        print(
+            "GLM52_SGLANG_BATCH_INVARIANCE="
+            + json.dumps(
+                {
+                    "samples": len(group),
+                    "tokens": int(reference.size),
+                    "max_slot_mae": max(slot_maes, default=0.0),
+                    "mean_slot_mae": sum(slot_maes) / max(len(slot_maes), 1),
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:

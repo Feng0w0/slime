@@ -119,6 +119,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="{}",
                 help="Extra environment variables for training process, e.g. PyTorch memory management ones.",
             )
+            parser.add_argument(
+                "--allow-random-init",
+                action="store_true",
+                default=False,
+                help=(
+                    "Allow Megatron actor construction without --load or "
+                    "--pretrained-checkpoint. Intended only for architecture "
+                    "smoke tests; normal training should load a checkpoint."
+                ),
+            )
             # Delta weight sync.
             parser.add_argument(
                 "--update-weight-mode",

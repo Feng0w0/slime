@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
 from slime.utils.http_utils import _wrap_ipv6
+from slime.utils.common import is_npu
 
 from ..megatron_to_hf import convert_to_hf
 from .common import all_gather_param, named_params_and_buffers
@@ -292,6 +293,7 @@ def connect_rollout_engines_from_distributed(
     for c in engine_gpu_counts:
         cumulative.append(cumulative[-1] + c)
 
+    backend = "hccl" if is_npu() else "nccl"
     refs = [
         engine.init_weights_update_group.remote(
             master_address=master_address,
@@ -299,12 +301,12 @@ def connect_rollout_engines_from_distributed(
             rank_offset=cumulative[i] + 1,
             world_size=world_size,
             group_name=group_name,
-            backend="nccl",
+            backend=backend,
         )
         for i, engine in enumerate(rollout_engines)
     ]
     model_update_groups = init_process_group(
-        backend="nccl",
+        backend=backend,
         init_method=f"tcp://{_wrap_ipv6(master_address)}:{master_port}",
         world_size=world_size,
         rank=0,

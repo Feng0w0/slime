@@ -12,6 +12,7 @@ from ray.actor import ActorHandle
 from tqdm import tqdm
 
 from slime.utils.distributed_utils import get_gloo_group
+from slime.utils.common import is_npu
 from slime.utils.types import ParamInfo
 
 from ..megatron_to_hf import convert_to_hf
@@ -45,6 +46,12 @@ def _build_flattened_tensor_data(
         "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
         "metadata": flattened_tensor_bucket.get_metadata(),
     }
+
+
+def _empty_cache_after_weight_update() -> None:
+    """Release CUDA cache without invalidating an active NPU graph capture."""
+    if not is_npu():
+        torch.cuda.empty_cache()
 
 
 class UpdateWeightFromTensor:
@@ -269,9 +276,9 @@ class UpdateWeightFromTensor:
                 torch.cuda.synchronize()
                 del refs, long_lived_tensors, hf_named_tensors
                 torch.cuda.ipc_collect()
-                torch.cuda.empty_cache()
+                _empty_cache_after_weight_update()
         del staging_buffers
-        torch.cuda.empty_cache()
+        _empty_cache_after_weight_update()
 
     @torch.no_grad()
     def update_weights(self) -> None:
@@ -307,7 +314,7 @@ class UpdateWeightFromTensor:
             # have already closed their IPC handles.
             del refs, long_lived_tensors, hf_named_tensors
             torch.cuda.ipc_collect()
-            torch.cuda.empty_cache()
+            _empty_cache_after_weight_update()
 
         if self._expert_transfer_plan:
             self._update_expert_weights(megatron_local_weights)
@@ -317,7 +324,7 @@ class UpdateWeightFromTensor:
         # After the barrier all engines have returned, so every rank's last-chunk
         # IPC handles are now released by the consumers.  Clean them up.
         torch.cuda.ipc_collect()
-        torch.cuda.empty_cache()
+        _empty_cache_after_weight_update()
 
         # int4/fp4 post_process
         if self.rank == 0:

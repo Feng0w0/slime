@@ -224,6 +224,8 @@ class TestZeroGpuRolloutConfig:
     def test_memory_saver_disables_default_breakable_prefill_cuda_graph(self, monkeypatch):
         from slime.backends.sglang_utils import sglang_engine
 
+        monkeypatch.setenv("SLIME_NPU_ENABLE_SGLANG_MEMORY_SAVER", "1")
+
         @dataclass
         class CurrentServerArgs:
             enable_memory_saver: bool = False

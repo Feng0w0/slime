@@ -16,6 +16,7 @@ from urllib3.exceptions import NewConnectionError
 from slime.backends.sglang_utils.external import get_server_info
 from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
+from slime.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,8 @@ def get_base_gpu_id(args, rank):
 
 
 def _to_local_gpu_id(physical_gpu_id: int) -> int:
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible_devices_var = "ASCEND_RT_VISIBLE_DEVICES" if is_npu() else "CUDA_VISIBLE_DEVICES"
+    cvd = os.environ.get(visible_devices_var)
     if not cvd:
         return physical_gpu_id  # no remapping
     # CUDA_VISIBLE_DEVICES can be like "4,5,6,7"
@@ -43,9 +45,15 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     if 0 <= physical_gpu_id < len(visible):
         return physical_gpu_id
     raise RuntimeError(
-        f"GPU id {physical_gpu_id} is not valid under CUDA_VISIBLE_DEVICES={cvd}. "
+        f"GPU id {physical_gpu_id} is not valid under {visible_devices_var}={cvd}. "
         f"Expected one of {visible} (physical) or 0..{len(visible)-1} (local)."
     )
+
+
+def _enable_sglang_memory_saver(args) -> bool:
+    if is_npu() and os.environ.get("SLIME_NPU_ENABLE_SGLANG_MEMORY_SAVER", "0") != "1":
+        return False
+    return args.offload_rollout
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
@@ -565,7 +573,7 @@ def _compute_server_args(
         "trust_remote_code": True,
         "random_seed": args.seed + rank,
         # memory
-        "enable_memory_saver": args.offload_rollout,
+        "enable_memory_saver": _enable_sglang_memory_saver(args),
         # distributed
         "host": host,
         "port": port,

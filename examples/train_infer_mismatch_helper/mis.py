@@ -1,6 +1,11 @@
+import json
+import os
 from typing import Any
 
 import torch
+
+_CONSISTENCY_TRACE_EMITTED = False
+_BATCH_INVARIANCE_TRACE_EMITTED = False
 
 # NOTE:
 # - `compute_mis_weights` is a lightweight, standalone function that is useful to unit-test on CPU.
@@ -171,10 +176,6 @@ def compute_mis_weights(
 
     metrics: dict[str, list[torch.Tensor]] = {}
 
-    tis_lower_bound = args.tis_lower_bound if args.tis_lower_bound is not None else 1.0 / args.tis_upper_bound
-    rs_lower_bound = args.rs_lower_bound if args.rs_lower_bound is not None else tis_lower_bound
-    rs_upper_bound = args.rs_upper_bound if args.rs_upper_bound is not None else args.tis_upper_bound
-
     # Validate input lists have same length and each sequence has matching shapes
     assert (
         len(train_log_probs) == len(rollout_log_probs) == len(loss_masks)
@@ -207,6 +208,10 @@ def compute_mis_weights(
     # only calculate mismatch metrics if TIS is not used
     if not args.use_tis:
         return None, loss_masks, metrics
+
+    tis_lower_bound = args.tis_lower_bound if args.tis_lower_bound is not None else 1.0 / args.tis_upper_bound
+    rs_lower_bound = args.rs_lower_bound if args.rs_lower_bound is not None else tis_lower_bound
+    rs_upper_bound = args.rs_upper_bound if args.rs_upper_bound is not None else args.tis_upper_bound
 
     # handle each sequence independently
     for train_log_prob, rollout_log_prob, loss_mask in zip(
@@ -347,6 +352,98 @@ def compute_mis_weights_with_cp(
             train_log_probs, total_lengths, response_lengths, strict=False
         )
     ]
+    current_train_log_probs = kwargs.get("current_train_log_probs")
+    full_current_train_log_probs = None
+    if current_train_log_probs is not None:
+        full_current_train_log_probs = [
+            all_gather_with_cp(log_prob, total_length, response_length)
+            for log_prob, total_length, response_length in zip(
+                current_train_log_probs, total_lengths, response_lengths, strict=False
+            )
+        ]
+
+    # Batch-invariance fixture: the consistency script uses one prompt with two
+    # greedy samples. Only compare the pair when the complete token sequences
+    # are byte-for-byte identical. This separates batch/packing effects inside
+    # each backend from the cross-backend train-vs-rollout error.
+    global _BATCH_INVARIANCE_TRACE_EMITTED
+    batch_invariance = None
+    if os.environ.get("GLM52_BATCH_INVARIANCE") == "1" and len(full_old_log_probs) >= 2:
+        tokens = kwargs.get("tokens")
+
+        def _first_two_sequences(value):
+            if isinstance(value, (list, tuple)) and len(value) >= 2:
+                return value[0].detach().reshape(-1), value[1].detach().reshape(-1)
+            if isinstance(value, torch.Tensor):
+                if value.ndim >= 2 and value.shape[0] >= 2:
+                    return value[0].detach().reshape(-1), value[1].detach().reshape(-1)
+                if value.ndim >= 1 and len(total_lengths) >= 2:
+                    value = value.detach().reshape(-1)
+                    first_len, second_len = int(total_lengths[0]), int(total_lengths[1])
+                    if value.numel() >= first_len + second_len:
+                        return value[:first_len].detach(), value[first_len : first_len + second_len].detach()
+            return None, None
+
+        token0, token1 = _first_two_sequences(tokens)
+        token_equal = (
+            token0 is not None
+            and token1 is not None
+            and token0.shape == token1.shape
+            and torch.equal(token0, token1)
+        )
+        train0, train1 = full_old_log_probs[:2]
+        rollout0, rollout1 = full_rollout_log_probs[:2]
+        comparable = (
+            token_equal
+            and train0.shape == train1.shape
+            and rollout0.shape == rollout1.shape
+            and train0.shape == rollout0.shape
+        )
+        if comparable:
+            train_abs = (train0 - train1).abs()
+            rollout_abs = (rollout0 - rollout1).abs()
+            mismatch_slot_abs = ((train0 - rollout0) - (train1 - rollout1)).abs()
+            batch_invariance = {
+                "train_batch_invariance_abs_diff": train_abs,
+                "rollout_batch_invariance_abs_diff": rollout_abs,
+                "mismatch_batch_slot_abs_diff": mismatch_slot_abs,
+            }
+            if full_current_train_log_probs is not None and len(full_current_train_log_probs) >= 2:
+                current0, current1 = full_current_train_log_probs[:2]
+                if current0.shape == current1.shape == rollout0.shape:
+                    batch_invariance["current_train_batch_invariance_abs_diff"] = (
+                        current0 - current1
+                    ).abs()
+                    batch_invariance["current_train_rollout_slot0_abs_diff"] = (
+                        current0 - rollout0
+                    ).abs()
+
+        if not _BATCH_INVARIANCE_TRACE_EMITTED:
+            try:
+                global_rank = torch.distributed.get_rank()
+            except (RuntimeError, ValueError):
+                global_rank = 0
+            if global_rank == 0:
+                payload = {
+                    "token_equal": bool(token_equal),
+                    "comparable": bool(comparable),
+                    "token_lengths": None if token0 is None or token1 is None else [token0.numel(), token1.numel()],
+                }
+                if batch_invariance is not None:
+                    payload.update(
+                        {
+                            key + "_mean": float(value.float().mean().item()) if value.numel() else 0.0
+                            for key, value in batch_invariance.items()
+                        }
+                    )
+                    payload.update(
+                        {
+                            key + "_max": float(value.float().max().item()) if value.numel() else 0.0
+                            for key, value in batch_invariance.items()
+                        }
+                    )
+                print("GLM52_BATCH_INVARIANCE_TRACE=" + json.dumps(payload, separators=(",", ":")), flush=True)
+                _BATCH_INVARIANCE_TRACE_EMITTED = True
 
     # Main logic for is (decoupled)
     is_weights, modified_masks, is_metrics = compute_mis_weights(
@@ -355,6 +452,25 @@ def compute_mis_weights_with_cp(
         rollout_log_probs=full_rollout_log_probs,
         loss_masks=loss_masks,
     )
+    if full_current_train_log_probs is not None:
+        for current, rollout in zip(full_current_train_log_probs, full_rollout_log_probs, strict=False):
+            metrics_append(is_metrics, "current_train_rollout_logprob_abs_diff", (current - rollout).abs())
+    if os.environ.get("GLM52_BATCH_INVARIANCE") == "1" and full_old_log_probs:
+        # Dynamic batching may place an uneven number of sequences on each DP
+        # rank (for example 3+1).  Every metric must therefore contain exactly
+        # one response-length tensor per local sequence; hard-coding two makes
+        # the downstream split_with_sizes reducer fail.  Ranks with only one
+        # local sequence report zeros because no local pair can be compared.
+        if batch_invariance is None:
+            batch_invariance = {
+                "train_batch_invariance_abs_diff": torch.zeros_like(full_old_log_probs[0]),
+                "rollout_batch_invariance_abs_diff": torch.zeros_like(full_old_log_probs[0]),
+                "mismatch_batch_slot_abs_diff": torch.zeros_like(full_old_log_probs[0]),
+            }
+        for key, value in batch_invariance.items():
+            for sequence in full_old_log_probs:
+                metric_value = value if value.shape == sequence.shape else torch.zeros_like(sequence)
+                metrics_append(is_metrics, key, metric_value)
 
     # Slice out the value shards for this CP rank and concat them into a 1D tensor along dim=0 for loss.py computation.
     def slice_cp_and_concat(
@@ -386,7 +502,41 @@ def add_ppl_metrics(
     loss_mask: torch.Tensor,
     metrics: dict[str, list[torch.Tensor]],
 ):
+    global _CONSISTENCY_TRACE_EMITTED
     loss_mask = loss_mask.float()
+
+    if os.environ.get("GLM52_CONSISTENCY_TRACE_TOKENS") == "1" and not _CONSISTENCY_TRACE_EMITTED:
+        try:
+            global_rank = torch.distributed.get_rank()
+        except (RuntimeError, ValueError):
+            global_rank = 0
+        if global_rank == 0:
+            valid = loss_mask.bool()
+            train_valid = train_log_prob[valid].detach().float().cpu()
+            rollout_valid = rollout_log_prob[valid].detach().float().cpu()
+            direct_abs = (train_valid - rollout_valid).abs()
+
+            def shifted_mae(left: torch.Tensor, right: torch.Tensor) -> float | None:
+                if left.numel() == 0 or right.numel() == 0:
+                    return None
+                return float((left - right).abs().mean().item())
+
+            trace_count = min(32, train_valid.numel())
+            payload = {
+                "valid_tokens": int(train_valid.numel()),
+                "direct_mae": float(direct_abs.mean().item()) if direct_abs.numel() else None,
+                "direct_max_abs": float(direct_abs.max().item()) if direct_abs.numel() else None,
+                "train_t_vs_rollout_t_plus_1_mae": shifted_mae(train_valid[:-1], rollout_valid[1:]),
+                "train_t_plus_1_vs_rollout_t_mae": shifted_mae(train_valid[1:], rollout_valid[:-1]),
+                "train_log_probs": train_valid[:trace_count].tolist(),
+                "rollout_log_probs": rollout_valid[:trace_count].tolist(),
+                "signed_diffs": (train_valid[:trace_count] - rollout_valid[:trace_count]).tolist(),
+            }
+            print(
+                "GLM52_CONSISTENCY_TOKEN_TRACE=" + json.dumps(payload, separators=(",", ":")),
+                flush=True,
+            )
+            _CONSISTENCY_TRACE_EMITTED = True
 
     mean_log_prob_training = masked_mean(train_log_prob, loss_mask, expand=True)
     training_log_ppl = -mean_log_prob_training
