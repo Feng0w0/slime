@@ -438,7 +438,18 @@ def forward_only(
         }
         if batch["multimodal_train_inputs"] is not None:
             forward_kwargs.update(batch["multimodal_train_inputs"])
-        output_tensor = model(**forward_kwargs)
+        from slime.backends.megatron_utils.prefill_consistency_dfx import (
+            clear_megatron_prefill_context,
+            set_megatron_prefill_context,
+        )
+
+        set_megatron_prefill_context(
+            unconcat_tokens, total_lengths, response_lengths
+        )
+        try:
+            output_tensor = model(**forward_kwargs)
+        finally:
+            clear_megatron_prefill_context()
 
         output_kwargs = {
             "args": args,

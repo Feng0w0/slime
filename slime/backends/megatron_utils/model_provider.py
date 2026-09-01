@@ -225,8 +225,12 @@ def wrap_model_provider_with_freeze(original_provider, args):
         # embedding/layer/logits boundaries.  Keeping this in the outer wrapper
         # covers both the built-in and custom model providers.
         from slime.backends.megatron_utils.phase2_dfx import install_phase2_forward_hooks
+        from slime.backends.megatron_utils.prefill_consistency_dfx import (
+            install_megatron_prefill_hooks,
+        )
 
         install_phase2_forward_hooks(model)
+        install_megatron_prefill_hooks(model)
 
         return model
 
