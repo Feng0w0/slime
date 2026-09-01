@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -40,6 +41,7 @@ __all__ = ["generate_rollout", "get_model_url"]
 logger = logging.getLogger(__name__)
 
 _PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
+_DFX_ROLLOUT_SEQUENCE_EMITTED = False
 
 
 def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
@@ -154,6 +156,7 @@ class GenerateState(metaclass=SingletonMeta):
 
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
     """Generate using traditional SGLang router with token-based workflow"""
+    global _DFX_ROLLOUT_SEQUENCE_EMITTED
     if args.ci_test:
         assert isinstance(sample.prompt, str)
 
@@ -277,6 +280,33 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
         if prefill_rescore_mode == "replace":
             new_response_log_probs = prefill_log_probs
+
+    if os.environ.get("GLM52_DFX_ENABLE") == "1" and not _DFX_ROLLOUT_SEQUENCE_EMITTED:
+        # Record the exact token sequence at the inference boundary.  The
+        # matching Megatron event is emitted after CP all-gather, so a digest
+        # mismatch identifies tokenization/packing before numerical kernels.
+        all_tokens = prompt_ids + new_response_tokens
+        trace_count = min(64, len(new_response_tokens))
+        token_bytes = np.asarray(all_tokens, dtype=np.int64).tobytes()
+        print(
+            "GLM52_DFX_ROLLOUT_SEQUENCE="
+            + json.dumps(
+                {
+                    "token_sha256": hashlib.sha256(token_bytes).hexdigest(),
+                    "total_length": len(all_tokens),
+                    "prompt_length": len(prompt_ids),
+                    "response_length": len(new_response_tokens),
+                    "token_head": all_tokens[:32],
+                    "token_tail": all_tokens[-32:],
+                    "response_tokens": new_response_tokens[:trace_count],
+                    "rollout_log_probs": [float(value) for value in new_response_log_probs[:trace_count]],
+                    "session_id": sample.session_id,
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+        _DFX_ROLLOUT_SEQUENCE_EMITTED = True
 
     sample.append_response_tokens(
         args,

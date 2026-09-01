@@ -1003,6 +1003,10 @@ def policy_loss_function(
             "pg_loss": pg_loss,
             "train_log_probs": train_log_probs_for_tis,
             "rollout_log_probs": batch["rollout_log_probs"],
+            # Preserve the exact prompt+response sequences for opt-in
+            # train/inference DFX. Built-in TIS functions accept extra kwargs,
+            # so this remains backward compatible when DFX is disabled.
+            "tokens": batch["unconcat_tokens"],
             "loss_masks": batch["loss_masks"],
             "total_lengths": total_lengths,
             "response_lengths": response_lengths,

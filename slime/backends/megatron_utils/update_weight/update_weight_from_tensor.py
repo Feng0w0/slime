@@ -12,6 +12,7 @@ from ray.actor import ActorHandle
 from tqdm import tqdm
 
 from slime.utils.distributed_utils import get_gloo_group
+from slime.utils.consistency_dfx import emit_weight_tensor
 from slime.utils.common import is_npu
 from slime.utils.types import ParamInfo
 
@@ -339,6 +340,18 @@ class UpdateWeightFromTensor:
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         all_refs = []
+
+        # Fingerprint the converted HF tensors immediately before either IPC
+        # or distributed transfer.  The same tensor names are emitted by
+        # SGLang after bucket reconstruction and again at loader entry.
+        for name, tensor in hf_named_tensors:
+            emit_weight_tensor(
+                stage="megatron_hf_before_send",
+                name=name,
+                tensor=tensor,
+                megatron_rank=self.rank,
+                weight_version=self.weight_version,
+            )
 
         refs_colocated, long_lived_tensors = _send_to_colocated_engine(
             hf_named_tensors,

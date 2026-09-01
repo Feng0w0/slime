@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from typing import Any
@@ -6,6 +7,7 @@ import torch
 
 _CONSISTENCY_TRACE_EMITTED = False
 _BATCH_INVARIANCE_TRACE_EMITTED = False
+_DFX_TRAIN_SEQUENCE_EMITTED = False
 
 # NOTE:
 # - `compute_mis_weights` is a lightweight, standalone function that is useful to unit-test on CPU.
@@ -361,6 +363,63 @@ def compute_mis_weights_with_cp(
                 current_train_log_probs, total_lengths, response_lengths, strict=False
             )
         ]
+
+    global _DFX_TRAIN_SEQUENCE_EMITTED
+    if os.environ.get("GLM52_DFX_ENABLE") == "1" and not _DFX_TRAIN_SEQUENCE_EMITTED:
+        try:
+            global_rank = torch.distributed.get_rank()
+        except (RuntimeError, ValueError):
+            global_rank = 0
+        tokens = kwargs.get("tokens")
+        sequence = None
+        if isinstance(tokens, (list, tuple)) and tokens:
+            sequence = tokens[0].detach().reshape(-1)
+        elif isinstance(tokens, torch.Tensor) and tokens.numel():
+            if tokens.ndim >= 2:
+                sequence = tokens[0].detach().reshape(-1)
+            else:
+                sequence = tokens.detach().reshape(-1)[: int(total_lengths[0])]
+        if global_rank == 0 and sequence is not None and full_old_log_probs:
+            total_length = int(total_lengths[0])
+            response_length = int(response_lengths[0])
+            sequence = sequence[:total_length].to(dtype=torch.long, device="cpu")
+            train_values = full_old_log_probs[0].detach().float().cpu()
+            rollout_values = full_rollout_log_probs[0].detach().float().cpu()
+            comparable = min(train_values.numel(), rollout_values.numel(), response_length)
+            train_values = train_values[:comparable]
+            rollout_values = rollout_values[:comparable]
+            diffs = (train_values - rollout_values).abs()
+            trace_count = min(64, comparable)
+            top_count = min(8, comparable)
+            top_positions = (
+                torch.topk(diffs, top_count).indices.tolist() if top_count else []
+            )
+            print(
+                "GLM52_DFX_TRAIN_SEQUENCE="
+                + json.dumps(
+                    {
+                        "token_sha256": hashlib.sha256(sequence.numpy().tobytes()).hexdigest(),
+                        "total_length": total_length,
+                        "prompt_length": total_length - response_length,
+                        "response_length": response_length,
+                        "token_head": sequence[:32].tolist(),
+                        "token_tail": sequence[-32:].tolist(),
+                        "response_tokens": (
+                            sequence[-response_length:][:trace_count].tolist()
+                            if response_length
+                            else []
+                        ),
+                        "train_log_probs": train_values[:trace_count].tolist(),
+                        "rollout_log_probs": rollout_values[:trace_count].tolist(),
+                        "signed_diffs": (train_values[:trace_count] - rollout_values[:trace_count]).tolist(),
+                        "largest_diff_positions": top_positions,
+                        "largest_abs_diffs": [float(diffs[index].item()) for index in top_positions],
+                    },
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+            _DFX_TRAIN_SEQUENCE_EMITTED = True
 
     # Batch-invariance fixture: the consistency script uses one prompt with two
     # greedy samples. Only compare the pair when the complete token sequences
