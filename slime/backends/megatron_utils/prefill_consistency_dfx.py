@@ -36,6 +36,25 @@ def _enabled() -> bool:
     return os.environ.get("GLM52_DFX_PREFILL") == "1"
 
 
+def _trace_layer_detail(layer_id: int) -> bool:
+    if os.environ.get("GLM52_DFX_LAYER_DETAIL") != "1":
+        return False
+    selected = os.environ.get("GLM52_DFX_LAYER_DETAIL_LAYERS", "0").strip().lower()
+    if selected in {"all", "*"}:
+        return True
+    for item in selected.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start, end = item.split("-", 1)
+            if int(start) <= layer_id <= int(end):
+                return True
+        elif int(item) == layer_id:
+            return True
+    return False
+
+
 def set_megatron_prefill_context(
     unconcat_tokens: list[torch.Tensor],
     total_lengths: list[int],
@@ -100,11 +119,34 @@ def _boundary(module_name: str) -> str | None:
     if module_name == "decoder.final_layernorm":
         return "final_norm"
     match = re.fullmatch(r"decoder\.layers\.(\d+)", module_name)
-    return f"layer.{match.group(1)}" if match else None
+    if match:
+        return f"layer.{match.group(1)}"
+
+    detail = re.fullmatch(
+        r"decoder\.layers\.(\d+)\."
+        r"(input_layernorm|pre_cross_attn_layernorm)",
+        module_name,
+    )
+    if not detail:
+        return None
+    layer_id = int(detail.group(1))
+    if not _trace_layer_detail(layer_id):
+        return None
+    suffix = {
+        "input_layernorm": "input_norm",
+        "pre_cross_attn_layernorm": "attention_residual",
+    }[detail.group(2)]
+    return f"layer.{layer_id}.{suffix}"
 
 
 @torch.no_grad()
-def _emit_hidden(boundary: str, output: Any, *, sequence_parallel: bool) -> None:
+def _emit_hidden(
+    boundary: str,
+    output: Any,
+    *,
+    sequence_parallel: bool,
+    trace_kind: str = "forward_output",
+) -> None:
     context = _CONTEXT
     if not _enabled() or context is None:
         return
@@ -160,9 +202,32 @@ def _emit_hidden(boundary: str, output: Any, *, sequence_parallel: bool) -> None
         "abs_max": float(torch.nan_to_num(vector).abs().max().item()),
         "rank": parallel_state.get_data_parallel_rank(with_context_parallel=True),
         "tp_rank": tp_rank,
+        "trace_kind": trace_kind,
     }
     _EMITTED[boundary] = _EMITTED.get(boundary, 0) + 1
     print(_MARKER + json.dumps(event, separators=(",", ":")), flush=True)
+
+
+def _dense_te_post_attention_norm(layer: torch.nn.Module, hidden: torch.Tensor):
+    """Reconstruct the RMSNorm fused into a dense TE MLP's linear_fc1.
+
+    Dense Transformer-Engine layers expose ``pre_mlp_layernorm`` as IdentityOp;
+    the real RMSNorm is fused into ``mlp.linear_fc1`` and has no hookable output.
+    Reconstructing it from the actual residual and affine weight gives SGLang a
+    semantically equivalent comparison point without changing either forward.
+    """
+
+    linear_fc1 = getattr(getattr(layer, "mlp", None), "linear_fc1", None)
+    weight = getattr(linear_fc1, "layer_norm_weight", None)
+    if weight is None:
+        return None
+    eps = float(getattr(layer.config, "layernorm_epsilon", 1.0e-5))
+    scale = weight.detach().float()
+    if bool(getattr(layer.config, "layernorm_zero_centered_gamma", False)):
+        scale = scale + 1.0
+    source = hidden.detach().float()
+    variance = source.square().mean(dim=-1, keepdim=True)
+    return (source * torch.rsqrt(variance + eps) * scale).to(hidden.dtype)
 
 
 def install_megatron_prefill_hooks(model: torch.nn.Module) -> None:
@@ -172,8 +237,12 @@ def install_megatron_prefill_hooks(model: torch.nn.Module) -> None:
         return
     _HOOKED_MODELS.add(id(model))
     sequence_parallel = bool(getattr(model.config, "sequence_parallel", False))
+    detailed_layers: list[tuple[int, torch.nn.Module]] = []
 
     for module_name, module in model.named_modules():
+        layer_match = re.fullmatch(r"decoder\.layers\.(\d+)", module_name)
+        if layer_match and _trace_layer_detail(int(layer_match.group(1))):
+            detailed_layers.append((int(layer_match.group(1)), module))
         boundary = _boundary(module_name)
         if boundary is None:
             continue
@@ -184,3 +253,45 @@ def install_megatron_prefill_hooks(model: torch.nn.Module) -> None:
             )
 
         module.register_forward_hook(hook)
+
+    for layer_id, layer in detailed_layers:
+        pre_mlp_layernorm = getattr(layer, "pre_mlp_layernorm", None)
+        if pre_mlp_layernorm is not None and not (
+            pre_mlp_layernorm.__class__.__name__ == "IdentityOp"
+        ):
+
+            def norm_hook(_module, _inputs, output, *, trace_layer_id=layer_id):
+                _emit_hidden(
+                    f"layer.{trace_layer_id}.post_attention_norm",
+                    output,
+                    sequence_parallel=sequence_parallel,
+                )
+
+            pre_mlp_layernorm.register_forward_hook(norm_hook)
+            continue
+
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None:
+            continue
+
+        def dense_mlp_pre_hook(
+            _module,
+            inputs,
+            *,
+            trace_layer_id=layer_id,
+            trace_layer=layer,
+        ):
+            hidden = _first_tensor(inputs)
+            if hidden is None:
+                return
+            normalized = _dense_te_post_attention_norm(trace_layer, hidden)
+            if normalized is None:
+                return
+            _emit_hidden(
+                f"layer.{trace_layer_id}.post_attention_norm",
+                normalized,
+                sequence_parallel=sequence_parallel,
+                trace_kind="derived_dense_te_fused_rmsnorm",
+            )
+
+        mlp.register_forward_pre_hook(dense_mlp_pre_hook)
