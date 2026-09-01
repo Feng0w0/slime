@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 _PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
 _DFX_ROLLOUT_SEQUENCE_EMITTED = False
+_DFX_PHASE1_ROLLOUT_EMITTED = False
 
 
 def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
@@ -156,7 +157,7 @@ class GenerateState(metaclass=SingletonMeta):
 
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
     """Generate using traditional SGLang router with token-based workflow"""
-    global _DFX_ROLLOUT_SEQUENCE_EMITTED
+    global _DFX_PHASE1_ROLLOUT_EMITTED, _DFX_ROLLOUT_SEQUENCE_EMITTED
     if args.ci_test:
         assert isinstance(sample.prompt, str)
 
@@ -212,6 +213,8 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
     else:
         new_response_tokens, new_response_log_probs = [], []
+    decode_response_log_probs = list(new_response_log_probs)
+    prefill_response_log_probs = None
 
     # Autoregressive decode and full-sequence training use different forward
     # shapes and, on NPU, can select different fused kernels.  For a controlled
@@ -253,6 +256,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         input_token_logprobs = input_token_logprobs[-len(new_response_tokens) :]
         prefill_tokens = [item[1] for item in input_token_logprobs]
         prefill_log_probs = [item[0] for item in input_token_logprobs]
+        prefill_response_log_probs = list(prefill_log_probs)
         if prefill_tokens != new_response_tokens:
             raise RuntimeError(
                 "SGLang prefill rescore token mismatch: "
@@ -280,6 +284,45 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
         if prefill_rescore_mode == "replace":
             new_response_log_probs = prefill_log_probs
+
+    if os.environ.get("GLM52_DFX_PHASE1") == "1" and not _DFX_PHASE1_ROLLOUT_EMITTED:
+        if len(new_response_tokens) != 1:
+            raise RuntimeError(
+                "GLM52_DFX_PHASE1 requires exactly one response token; "
+                f"got {len(new_response_tokens)}"
+            )
+        if prefill_response_log_probs is None:
+            raise RuntimeError(
+                "GLM52_DFX_PHASE1 requires SLIME_CONSISTENCY_PREFILL_RESCORE=replace"
+            )
+        all_tokens = prompt_ids + new_response_tokens
+        token_sha256 = hashlib.sha256(
+            np.asarray(all_tokens, dtype=np.int64).tobytes()
+        ).hexdigest()
+        decode_log_prob = float(decode_response_log_probs[0])
+        prefill_log_prob = float(prefill_response_log_probs[0])
+        selected_log_prob = float(new_response_log_probs[0])
+        print(
+            "GLM52_DFX_PHASE1_ROLLOUT="
+            + json.dumps(
+                {
+                    "token_sha256": token_sha256,
+                    "total_length": len(all_tokens),
+                    "prompt_length": len(prompt_ids),
+                    "response_length": 1,
+                    "response_token": int(new_response_tokens[0]),
+                    "decode_log_prob": decode_log_prob,
+                    "prefill_log_prob": prefill_log_prob,
+                    "selected_rollout_log_prob": selected_log_prob,
+                    "decode_prefill_abs_diff": abs(decode_log_prob - prefill_log_prob),
+                    "rescore_mode": prefill_rescore_mode,
+                    "session_id": sample.session_id,
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+        _DFX_PHASE1_ROLLOUT_EMITTED = True
 
     if os.environ.get("GLM52_DFX_ENABLE") == "1" and not _DFX_ROLLOUT_SEQUENCE_EMITTED:
         # Record the exact token sequence at the inference boundary.  The

@@ -8,6 +8,7 @@ import torch
 _CONSISTENCY_TRACE_EMITTED = False
 _BATCH_INVARIANCE_TRACE_EMITTED = False
 _DFX_TRAIN_SEQUENCE_EMITTED = False
+_DFX_PHASE1_TRAIN_EMITTED = False
 
 # NOTE:
 # - `compute_mis_weights` is a lightweight, standalone function that is useful to unit-test on CPU.
@@ -364,7 +365,7 @@ def compute_mis_weights_with_cp(
             )
         ]
 
-    global _DFX_TRAIN_SEQUENCE_EMITTED
+    global _DFX_PHASE1_TRAIN_EMITTED, _DFX_TRAIN_SEQUENCE_EMITTED
     if os.environ.get("GLM52_DFX_ENABLE") == "1" and not _DFX_TRAIN_SEQUENCE_EMITTED:
         try:
             global_rank = torch.distributed.get_rank()
@@ -394,11 +395,12 @@ def compute_mis_weights_with_cp(
             top_positions = (
                 torch.topk(diffs, top_count).indices.tolist() if top_count else []
             )
+            token_sha256 = hashlib.sha256(sequence.numpy().tobytes()).hexdigest()
             print(
                 "GLM52_DFX_TRAIN_SEQUENCE="
                 + json.dumps(
                     {
-                        "token_sha256": hashlib.sha256(sequence.numpy().tobytes()).hexdigest(),
+                        "token_sha256": token_sha256,
                         "total_length": total_length,
                         "prompt_length": total_length - response_length,
                         "response_length": response_length,
@@ -420,6 +422,34 @@ def compute_mis_weights_with_cp(
                 flush=True,
             )
             _DFX_TRAIN_SEQUENCE_EMITTED = True
+
+            if os.environ.get("GLM52_DFX_PHASE1") == "1" and not _DFX_PHASE1_TRAIN_EMITTED:
+                if response_length != 1 or comparable != 1:
+                    raise RuntimeError(
+                        "GLM52_DFX_PHASE1 requires exactly one comparable response token; "
+                        f"response_length={response_length}, comparable={comparable}"
+                    )
+                train_log_prob = float(train_values[0].item())
+                rollout_log_prob = float(rollout_values[0].item())
+                print(
+                    "GLM52_DFX_PHASE1_TRAIN="
+                    + json.dumps(
+                        {
+                            "token_sha256": token_sha256,
+                            "total_length": total_length,
+                            "prompt_length": total_length - response_length,
+                            "response_length": 1,
+                            "response_token": int(sequence[-1].item()),
+                            "train_log_prob": train_log_prob,
+                            "rollout_log_prob": rollout_log_prob,
+                            "train_rollout_signed_diff": train_log_prob - rollout_log_prob,
+                            "train_rollout_abs_diff": abs(train_log_prob - rollout_log_prob),
+                        },
+                        separators=(",", ":"),
+                    ),
+                    flush=True,
+                )
+                _DFX_PHASE1_TRAIN_EMITTED = True
 
     # Batch-invariance fixture: the consistency script uses one prompt with two
     # greedy samples. Only compare the pair when the complete token sequences
