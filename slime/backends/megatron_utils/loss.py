@@ -30,6 +30,7 @@ from .cp_utils import (
     get_sum_of_sample_mean,
     slice_log_prob_with_cp,
 )
+from .phase2_dfx import emit_phase2_tensor
 
 ROLLOUT_TOP_P_TOKEN_KEYS = (
     "rollout_top_p_token_ids",
@@ -494,10 +495,23 @@ def get_log_probs_and_entropy(
     assert logits.size(0) == 1, f"{logits.shape}"
     logits = logits.squeeze(0)
 
+    emit_phase2_tensor(
+        "logits_before_temperature",
+        logits,
+        stage="logprob_boundary",
+        metadata={"rollout_temperature": float(getattr(args, "rollout_temperature", 1.0))},
+    )
+
     # Apply rollout temperature scaling to logits to match rollout-time log-probs.
     rollout_temperature = getattr(args, "rollout_temperature", 1.0)
     if rollout_temperature != 1.0:
         logits = logits / rollout_temperature
+    emit_phase2_tensor(
+        "logits_after_temperature",
+        logits,
+        stage="logprob_boundary",
+        metadata={"rollout_temperature": float(rollout_temperature)},
+    )
     logits = logits.contiguous()
     T = logits.size(0)
     device = logits.device
@@ -533,6 +547,12 @@ def get_log_probs_and_entropy(
         with_entropy_grad=with_entropy_grad,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
+    )
+    emit_phase2_tensor(
+        "log_probs_after_kernel",
+        log_prob_full,
+        stage="logprob_boundary",
+        metadata={"rollout_temperature": float(rollout_temperature)},
     )
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 

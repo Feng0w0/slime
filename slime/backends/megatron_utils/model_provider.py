@@ -221,6 +221,13 @@ def wrap_model_provider_with_freeze(original_provider, args):
         model = original_provider(**provider_kwargs)
         freeze_model_params(model, args)
 
+        # Phase 2 DFX is opt-in and installs one-shot hooks on the Megatron
+        # embedding/layer/logits boundaries.  Keeping this in the outer wrapper
+        # covers both the built-in and custom model providers.
+        from slime.backends.megatron_utils.phase2_dfx import install_phase2_forward_hooks
+
+        install_phase2_forward_hooks(model)
+
         return model
 
     return wrapped_provider
