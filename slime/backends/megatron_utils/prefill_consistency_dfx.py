@@ -55,6 +55,30 @@ def _trace_layer_detail(layer_id: int) -> bool:
     return False
 
 
+def _trace_attention_detail(layer_id: int) -> bool:
+    if not _trace_layer_detail(layer_id):
+        return False
+    if os.environ.get("GLM52_DFX_ATTN_DETAIL") != "1":
+        return False
+    selected = os.environ.get(
+        "GLM52_DFX_ATTN_DETAIL_LAYERS",
+        os.environ.get("GLM52_DFX_LAYER_DETAIL_LAYERS", "0"),
+    ).strip().lower()
+    if selected in {"all", "*"}:
+        return True
+    for item in selected.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start, end = item.split("-", 1)
+            if int(start) <= layer_id <= int(end):
+                return True
+        elif int(item) == layer_id:
+            return True
+    return False
+
+
 def set_megatron_prefill_context(
     unconcat_tokens: list[torch.Tensor],
     total_lengths: list[int],
@@ -202,6 +226,7 @@ def _emit_hidden(
         "abs_max": float(torch.nan_to_num(vector).abs().max().item()),
         "rank": parallel_state.get_data_parallel_rank(with_context_parallel=True),
         "tp_rank": tp_rank,
+        "tp_size": parallel_state.get_tensor_model_parallel_world_size(),
         "trace_kind": trace_kind,
     }
     _EMITTED[boundary] = _EMITTED.get(boundary, 0) + 1
@@ -255,6 +280,27 @@ def install_megatron_prefill_hooks(model: torch.nn.Module) -> None:
         module.register_forward_hook(hook)
 
     for layer_id, layer in detailed_layers:
+        if _trace_attention_detail(layer_id):
+            self_attention = getattr(layer, "self_attention", None)
+            if self_attention is not None:
+
+                def trace_attention(
+                    suffix,
+                    tensor,
+                    *,
+                    tensor_sequence_parallel=True,
+                    trace_kind="forward_output",
+                    trace_layer_id=layer_id,
+                ):
+                    _emit_hidden(
+                        f"layer.{trace_layer_id}.attn.{suffix}",
+                        tensor,
+                        sequence_parallel=tensor_sequence_parallel,
+                        trace_kind=trace_kind,
+                    )
+
+                self_attention._glm52_dfx_trace_attention = trace_attention
+
         pre_mlp_layernorm = getattr(layer, "pre_mlp_layernorm", None)
         if pre_mlp_layernorm is not None and not (
             pre_mlp_layernorm.__class__.__name__ == "IdentityOp"

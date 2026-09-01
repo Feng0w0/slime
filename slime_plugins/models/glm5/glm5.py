@@ -37,6 +37,51 @@ from .ops.sparse_mla import SparseMLA
 _INDEXER_SUBMODULE_NAMES = ("wq_b", "wk", "k_norm", "weights_proj")
 
 
+def _trace_attention_tensor(
+    module,
+    suffix: str,
+    tensor: torch.Tensor,
+    *,
+    sequence_parallel: bool,
+    trace_kind: str = "forward_output",
+) -> None:
+    """Call the Slime-installed tracer without coupling this plugin to Slime."""
+
+    callback = getattr(module, "_glm52_dfx_trace_attention", None)
+    if callback is not None:
+        callback(
+            suffix,
+            tensor,
+            tensor_sequence_parallel=sequence_parallel,
+            trace_kind=trace_kind,
+        )
+
+
+def _trace_fused_rmsnorm_input(module, suffix: str, source: torch.Tensor, linear) -> None:
+    """Reconstruct a TE-fused RMSNorm only while attention DFX is active."""
+
+    if getattr(module, "_glm52_dfx_trace_attention", None) is None:
+        return
+    weight = getattr(linear, "layer_norm_weight", None)
+    if weight is None:
+        return
+    scale = weight.detach().float()
+    if bool(getattr(module.config, "layernorm_zero_centered_gamma", False)):
+        scale = scale + 1.0
+    source_fp32 = source.detach().float()
+    variance = source_fp32.square().mean(dim=-1, keepdim=True)
+    normalized = source_fp32 * torch.rsqrt(
+        variance + float(module.config.layernorm_epsilon)
+    ) * scale
+    _trace_attention_tensor(
+        module,
+        suffix,
+        normalized.to(source.dtype),
+        sequence_parallel=bool(module.config.sequence_parallel),
+        trace_kind="derived_te_fused_rmsnorm",
+    )
+
+
 class GLM5TransformerLayer(TransformerLayer):
     """GLM-5 layer with opt-in consistency diagnostics.
 
@@ -323,6 +368,13 @@ class DSAMultiLatentAttention(Attention):
             ends = scatter_to_sequence_parallel_region(ends, group=parallel_state.get_context_parallel_group())
             _, topk_indices = fused_select_topk(index_query, index_key, head_weights, starts, ends)
 
+        _trace_attention_tensor(
+            self,
+            "topk_indices",
+            topk_indices,
+            sequence_parallel=bool(self.config.sequence_parallel),
+        )
+
         core_attn_out, _ = SparseMLA.apply(
             q,
             kv,
@@ -330,7 +382,19 @@ class DSAMultiLatentAttention(Attention):
             self.softmax_scale,
             packed_seq_params.cu_seqlens_q,
         )
+        _trace_attention_tensor(
+            self,
+            "core_out",
+            core_attn_out,
+            sequence_parallel=bool(self.config.sequence_parallel),
+        )
         core_attn_out = torch.einsum("thm,hdm->thd", core_attn_out, wv)
+        _trace_attention_tensor(
+            self,
+            "value_mix",
+            core_attn_out,
+            sequence_parallel=bool(self.config.sequence_parallel),
+        )
 
         core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
 
@@ -571,8 +635,20 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         # down proj are `TELinear`s, so the output is gathered and not TP-partitioned.`
         q_compressed, _ = self.linear_q_down_proj(hidden_states)
         q_compressed = q_compressed.squeeze(1)
+        _trace_attention_tensor(
+            self,
+            "q_down",
+            q_compressed,
+            sequence_parallel=bool(self.config.sequence_parallel),
+        )
 
         kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+        _trace_attention_tensor(
+            self,
+            "kv_down",
+            kv_combined,
+            sequence_parallel=bool(self.config.sequence_parallel),
+        )
         if self.config.sequence_parallel:
             kv_combined = gather_from_sequence_parallel_region(kv_combined)
         kv_compressed, k_pos_emb = torch.split(
@@ -584,8 +660,17 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         # absorb
         # =========================================
         q_compressed = self.q_layernorm(q_compressed)
+        _trace_fused_rmsnorm_input(
+            self, "q_norm", q_compressed, self.linear_q_up_proj
+        )
         q, _ = self.linear_q_up_proj(q_compressed)
         q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
+        _trace_attention_tensor(
+            self,
+            "q_up",
+            q,
+            sequence_parallel=bool(self.config.sequence_parallel),
+        )
         q_no_pe, q_pos_emb = torch.split(q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1)
 
         w_kc, w_vc = self.linear_kv_up_proj.weight.unflatten(
@@ -595,6 +680,12 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
 
         # absorb
         q_no_pe = torch.einsum("thd,hdm->thm", q_no_pe, w_kc)
+        _trace_attention_tensor(
+            self,
+            "q_absorbed",
+            q_no_pe,
+            sequence_parallel=bool(self.config.sequence_parallel),
+        )
 
         # use scatter and gather here, to make the kv grad all reduce in tp
         kv_compressed = torch.nn.functional.rms_norm(
@@ -603,6 +694,12 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
             weight=self.linear_kv_up_proj.layer_norm_weight.float(),
             eps=self.config.layernorm_epsilon,
         ).to(kv_compressed.dtype)
+        _trace_attention_tensor(
+            self,
+            "kv_norm",
+            kv_compressed,
+            sequence_parallel=False,
+        )
 
         k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=parallel_state.get_context_parallel_group())
         kv_compressed = gather_from_sequence_parallel_region(
@@ -637,6 +734,18 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
 
         q_pos_emb = fuse_rope(q_pos_emb, cu_seqlens_q, gathered=False)
         k_pos_emb = fuse_rope(k_pos_emb, cu_seqlens_kv, gathered=True)
+        _trace_attention_tensor(
+            self,
+            "q_rope",
+            q_pos_emb,
+            sequence_parallel=bool(self.config.sequence_parallel),
+        )
+        _trace_attention_tensor(
+            self,
+            "k_rope",
+            k_pos_emb,
+            sequence_parallel=False,
+        )
 
         query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
         key = torch.cat([kv_compressed, k_pos_emb], dim=-1)
