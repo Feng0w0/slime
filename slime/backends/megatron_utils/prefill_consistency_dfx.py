@@ -170,6 +170,7 @@ def _emit_hidden(
     *,
     sequence_parallel: bool,
     trace_kind: str = "forward_output",
+    flatten_token_dims: bool = False,
 ) -> None:
     context = _CONTEXT
     if not _enabled() or context is None:
@@ -196,7 +197,14 @@ def _emit_hidden(
         return
 
     position = context.packed_position
-    if gathered.ndim == 2:
+    if flatten_token_dims:
+        if position >= gathered.shape[0]:
+            return
+        # Attention internals use [token, local_heads, head_dim].  Preserve all
+        # local heads; the generic [token, batch, hidden] path below deliberately
+        # selects batch zero instead.
+        vector = gathered[position]
+    elif gathered.ndim == 2:
         if position >= gathered.shape[0]:
             return
         vector = gathered[position]
@@ -218,6 +226,12 @@ def _emit_hidden(
         "prediction_position": context.prediction_position,
         "packed_position": context.packed_position,
         "response_token": context.response_token,
+        "tensor_shape": list(gathered.shape),
+        "token_layout": (
+            "token_first_flatten_remaining"
+            if flatten_token_dims
+            else "token_batch_hidden"
+        ),
         "hidden_size": vector.numel(),
         "vector_dtype": "float32",
         "vector_sha256": hashlib.sha256(vector_bytes).hexdigest(),
@@ -297,6 +311,7 @@ def install_megatron_prefill_hooks(model: torch.nn.Module) -> None:
                         tensor,
                         sequence_parallel=tensor_sequence_parallel,
                         trace_kind=trace_kind,
+                        flatten_token_dims=True,
                     )
 
                 self_attention._glm52_dfx_trace_attention = trace_attention

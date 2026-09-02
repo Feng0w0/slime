@@ -82,6 +82,68 @@ def _trace_fused_rmsnorm_input(module, suffix: str, source: torch.Tensor, linear
     )
 
 
+def _trace_rope_reference(
+    module,
+    q_pos_emb: torch.Tensor,
+    k_pos_emb: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    rotary_pos_emb: torch.Tensor,
+    mscale: float,
+) -> None:
+    """Emit canonical packed RoPE inputs, positions, and selected cos/sin rows."""
+
+    if getattr(module, "_glm52_dfx_trace_attention", None) is None:
+        return
+
+    _trace_attention_tensor(
+        module,
+        "q_rope_input",
+        q_pos_emb,
+        sequence_parallel=bool(module.config.sequence_parallel),
+    )
+    _trace_attention_tensor(
+        module,
+        "k_rope_input",
+        k_pos_emb,
+        sequence_parallel=False,
+    )
+
+    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).detach().cpu().tolist()
+    positions = torch.cat(
+        [
+            torch.arange(int(length), device=k_pos_emb.device, dtype=torch.int64)
+            for length in lengths
+        ],
+        dim=0,
+    ).reshape(-1, 1)
+    _trace_attention_tensor(
+        module, "position_ids", positions, sequence_parallel=False
+    )
+
+    freqs = rotary_pos_emb[:, 0, 0, :]
+    if bool(module.config.rotary_interleaved):
+        canonical_freqs = freqs[..., 0::2]
+    else:
+        canonical_freqs = freqs[..., : freqs.shape[-1] // 2]
+    packed_freqs = torch.cat(
+        [canonical_freqs[: int(length)] for length in lengths], dim=0
+    )
+    _trace_attention_tensor(
+        module,
+        "rope_cos",
+        torch.cos(packed_freqs) * float(mscale),
+        sequence_parallel=False,
+        trace_kind="derived_rope_reference",
+    )
+    _trace_attention_tensor(
+        module,
+        "rope_sin",
+        torch.sin(packed_freqs) * float(mscale),
+        sequence_parallel=False,
+        trace_kind="derived_rope_reference",
+    )
+
+
 class GLM5TransformerLayer(TransformerLayer):
     """GLM-5 layer with opt-in consistency diagnostics.
 
@@ -704,6 +766,15 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=parallel_state.get_context_parallel_group())
         kv_compressed = gather_from_sequence_parallel_region(
             kv_compressed, group=parallel_state.get_context_parallel_group()
+        )
+
+        _trace_rope_reference(
+            self,
+            q_pos_emb,
+            k_pos_emb,
+            cu_seqlens_q,
+            rotary_pos_emb,
+            mscale,
         )
 
         def fuse_rope(q, cu_seqlens, gathered=False):
