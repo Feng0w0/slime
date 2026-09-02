@@ -89,11 +89,11 @@ def _trace_rope_reference(
     cu_seqlens: torch.Tensor,
     rotary_pos_emb: torch.Tensor,
     mscale: float,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Emit canonical packed RoPE inputs, positions, and selected cos/sin rows."""
 
     if getattr(module, "_glm52_dfx_trace_attention", None) is None:
-        return
+        return None
 
     _trace_attention_tensor(
         module,
@@ -142,6 +142,66 @@ def _trace_rope_reference(
         sequence_parallel=False,
         trace_kind="derived_rope_reference",
     )
+
+    packed_rotary = torch.cat(
+        [rotary_pos_emb[: int(length)] for length in lengths], dim=0
+    )
+    runtime_cos = (torch.cos(packed_rotary) * float(mscale)).to(q_pos_emb.dtype)
+    runtime_sin = (torch.sin(packed_rotary) * float(mscale)).to(q_pos_emb.dtype)
+    _trace_attention_tensor(
+        module,
+        "rope_runtime_cos",
+        runtime_cos,
+        sequence_parallel=False,
+        trace_kind="actual_packed_rope_operand",
+    )
+    _trace_attention_tensor(
+        module,
+        "rope_runtime_sin",
+        runtime_sin,
+        sequence_parallel=False,
+        trace_kind="actual_packed_rope_operand",
+    )
+
+    def software_reference(tensor: torch.Tensor) -> torch.Tensor:
+        value = tensor.unsqueeze(1)
+        half_layout = torch.cat((value[..., 0::2], value[..., 1::2]), dim=-1)
+        first, second = half_layout.chunk(2, dim=-1)
+        rotated = torch.cat((-second, first), dim=-1)
+        return (half_layout * runtime_cos + rotated * runtime_sin).squeeze(1)
+
+    q_reference = software_reference(q_pos_emb)
+    k_reference = software_reference(k_pos_emb)
+    _trace_attention_tensor(
+        module,
+        "q_rope_software_ref",
+        q_reference,
+        sequence_parallel=bool(module.config.sequence_parallel),
+        trace_kind="derived_pure_torch_rope",
+    )
+    _trace_attention_tensor(
+        module,
+        "k_rope_software_ref",
+        k_reference,
+        sequence_parallel=False,
+        trace_kind="derived_pure_torch_rope",
+    )
+    # Matching SGLang events contain the actual NPU output.
+    _trace_attention_tensor(
+        module,
+        "q_rope_npu_vs_megatron_ref",
+        q_reference,
+        sequence_parallel=bool(module.config.sequence_parallel),
+        trace_kind="derived_pure_torch_rope",
+    )
+    _trace_attention_tensor(
+        module,
+        "k_rope_npu_vs_megatron_ref",
+        k_reference,
+        sequence_parallel=False,
+        trace_kind="derived_pure_torch_rope",
+    )
+    return q_reference, k_reference
 
 
 class GLM5TransformerLayer(TransformerLayer):
@@ -768,7 +828,7 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
             kv_compressed, group=parallel_state.get_context_parallel_group()
         )
 
-        _trace_rope_reference(
+        rope_dfx_references = _trace_rope_reference(
             self,
             q_pos_emb,
             k_pos_emb,
@@ -805,6 +865,20 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
 
         q_pos_emb = fuse_rope(q_pos_emb, cu_seqlens_q, gathered=False)
         k_pos_emb = fuse_rope(k_pos_emb, cu_seqlens_kv, gathered=True)
+        if rope_dfx_references is not None:
+            # Matching SGLang events contain its independent software reference.
+            _trace_attention_tensor(
+                self,
+                "q_rope_sglang_ref_vs_megatron",
+                q_pos_emb,
+                sequence_parallel=bool(self.config.sequence_parallel),
+            )
+            _trace_attention_tensor(
+                self,
+                "k_rope_sglang_ref_vs_megatron",
+                k_pos_emb,
+                sequence_parallel=False,
+            )
         _trace_attention_tensor(
             self,
             "q_rope",
