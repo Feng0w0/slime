@@ -1,4 +1,5 @@
 import logging
+import os
 from argparse import Namespace
 from collections.abc import Sequence
 
@@ -55,6 +56,9 @@ def get_batch(
     """
 
     assert "tokens" in keys
+    pad_multiplier = int(
+        os.getenv("SLIME_CONSISTENCY_PAD_MULTIPLIER", str(pad_multiplier))
+    )
     batch = data_iterator.get_next(keys)
 
     tokens = batch["tokens"]

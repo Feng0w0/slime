@@ -232,8 +232,15 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         if images:
             raise NotImplementedError("Consistency prefill rescore currently supports text-only samples")
 
+        score_input_ids = prompt_ids + new_response_tokens
+        rescore_pad_multiple = int(
+            os.environ.get("SLIME_CONSISTENCY_RESCORE_PAD_MULTIPLE", "1")
+        )
+        rescore_pad = (-len(score_input_ids)) % max(rescore_pad_multiple, 1)
+        if rescore_pad:
+            score_input_ids = score_input_ids + [0] * rescore_pad
         score_payload = {
-            "input_ids": prompt_ids + new_response_tokens,
+            "input_ids": score_input_ids,
             # SGLang reports logprobs after temperature scaling.  Keep the
             # teacher-forced rescore on the exact same distribution as decode;
             # Megatron's consistency path applies the same logits/temperature.
@@ -253,7 +260,12 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
             score_output = await post(url, score_payload, headers=headers)
 
         input_token_logprobs = score_output["meta_info"].get("input_token_logprobs") or []
-        input_token_logprobs = input_token_logprobs[-len(new_response_tokens) :]
+        if rescore_pad:
+            input_token_logprobs = input_token_logprobs[
+                -(len(new_response_tokens) + rescore_pad) : -rescore_pad
+            ]
+        else:
+            input_token_logprobs = input_token_logprobs[-len(new_response_tokens) :]
         prefill_tokens = [item[1] for item in input_token_logprobs]
         prefill_log_probs = [item[0] for item in input_token_logprobs]
         prefill_response_log_probs = list(prefill_log_probs)
