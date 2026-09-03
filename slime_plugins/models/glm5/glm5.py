@@ -490,6 +490,20 @@ class DSAMultiLatentAttention(Attention):
             ends = scatter_to_sequence_parallel_region(ends, group=parallel_state.get_context_parallel_group())
             _, topk_indices = fused_select_topk(index_query, index_key, head_weights, starts, ends)
 
+        if os.getenv("SLIME_CONSISTENCY_CANONICAL_INDICES") == "1":
+            # Sort valid ids deterministically on both train and rollout sides,
+            # but keep -1 padding behind them for sparse attention.
+            invalid_sentinel = torch.iinfo(topk_indices.dtype).max
+            topk_indices = torch.where(
+                topk_indices >= 0,
+                topk_indices,
+                invalid_sentinel,
+            )
+            topk_indices = torch.sort(topk_indices, dim=-1).values
+            topk_indices = topk_indices.masked_fill(
+                topk_indices == invalid_sentinel,
+                -1,
+            ).contiguous()
         _trace_attention_tensor(
             self,
             "topk_indices",
